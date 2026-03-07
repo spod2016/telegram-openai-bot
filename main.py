@@ -31,8 +31,9 @@ logger = logging.getLogger(__name__)
 # Global game state
 games: dict = {}
 
-# ConversationHandler state
-WAITING_FOR_ANSWER = 1
+# ConversationHandler states
+WAITING_FOR_STYLE = 1
+WAITING_FOR_ANSWER = 2
 
 ROLES = ["WHO", "WHAT ARE THEY DOING", "WHERE", "MOOD", "TWIST"]
 ROLE_QUESTIONS = [
@@ -42,6 +43,20 @@ ROLE_QUESTIONS = [
     "🌫️ You are the MOOD. What is the atmosphere or tone? (reply with a mood or feeling, e.g. eerie, joyful, tense)",
     "🌀 You are the TWIST. Add an unexpected detail! (reply with something surprising or bizarre)",
 ]
+
+STYLES = [
+    ("Comic Book", "comic book style, vibrant colors, bold outlines, halftone dots, action panels"),
+    ("Watercolor", "soft watercolor illustration, pastel tones, flowing washes, delicate brushstrokes"),
+    ("Pixel Art", "retro pixel art, 16-bit style, chunky pixels, game sprite aesthetic"),
+    ("Oil Painting", "classical oil painting, rich textures, dramatic lighting, old masters style"),
+    ("Anime", "anime style, clean linework, expressive characters, colorful cel shading"),
+    ("Noir", "black and white noir, high contrast, dramatic shadows, film noir atmosphere"),
+    ("Surrealist", "surrealist dreamscape, Salvador Dali inspired, melting reality, bizarre imagery"),
+    ("Cyberpunk", "cyberpunk aesthetic, neon lights, dark dystopian city, futuristic glowing elements"),
+    ("Children's Book", "children's book illustration, cute, warm, simple shapes, friendly characters"),
+    ("Renaissance", "Renaissance painting style, classical composition, chiaroscuro lighting, museum quality"),
+]
+
 GAME_TIMEOUT_MINUTES = 30
 
 
@@ -53,20 +68,45 @@ def is_game_expired(game: dict) -> bool:
     return datetime.utcnow() - game["created_at"] > timedelta(minutes=GAME_TIMEOUT_MINUTES)
 
 
-async def create_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def build_style_menu() -> str:
+    lines = ["🎨 <b>Choose an art style for your image:</b>\n"]
+    for i, (name, _) in enumerate(STYLES, 1):
+        lines.append(f"{i}. {name}")
+    lines.append("\nReply with a number (1–10).")
+    return "\n".join(lines)
+
+
+async def create_game_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         await update.message.reply_text("⚠️ This bot only works in private chats.")
-        return
+        return ConversationHandler.END
 
     args = context.args
     if not args or not args[0].isdigit():
         await update.message.reply_text("Usage: /create N (where N is between 2 and 5)")
-        return
+        return ConversationHandler.END
 
     n = int(args[0])
     if n < 2 or n > 5:
         await update.message.reply_text("❌ Number of players must be between 2 and 5.")
-        return
+        return ConversationHandler.END
+
+    context.user_data["pending_num_players"] = n
+
+    await update.message.reply_text(build_style_menu(), parse_mode="HTML")
+    return WAITING_FOR_STYLE
+
+
+async def receive_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    if not text.isdigit() or not (1 <= int(text) <= 10):
+        await update.message.reply_text("⚠️ Please reply with a number between 1 and 10.")
+        return WAITING_FOR_STYLE
+
+    style_index = int(text) - 1
+    style_name, style_prompt = STYLES[style_index]
+    n = context.user_data.get("pending_num_players", 2)
 
     token = generate_token()
     while token in games:
@@ -75,23 +115,28 @@ async def create_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     games[token] = {
         "token": token,
         "num_players": n,
-        "answers": {},       # chat_id -> answer text
-        "roles": {},         # chat_id -> role index
-        "player_order": [],  # ordered list of chat_ids
+        "answers": {},
+        "roles": {},
+        "player_order": [],
+        "player_names": {},
         "created_at": datetime.utcnow(),
         "finished": False,
+        "style_name": style_name,
+        "style_prompt": style_prompt,
     }
 
     await update.message.reply_text(
         f"✅ Game created!\n\n"
         f"🔑 Token: <code>{token}</code>\n"
-        f"👥 Players needed: {n}\n\n"
+        f"👥 Players needed: {n}\n"
+        f"🎨 Style: <b>{style_name}</b>\n\n"
         f"Share this token with {n - 1} other player(s).\n"
         f"Everyone (including you) should use the command below.\n\n"
         f"⏳ This game expires in {GAME_TIMEOUT_MINUTES} minutes.",
         parse_mode="HTML",
     )
     await update.message.reply_text(f"/play {token}")
+    return ConversationHandler.END
 
 
 async def play_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -134,6 +179,16 @@ async def play_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role_index = len(game["player_order"])
     game["player_order"].append(chat_id)
     game["roles"][chat_id] = role_index
+
+    # Store player display name
+    user = update.effective_user
+    if user.username:
+        display_name = f"@{user.username}"
+    else:
+        display_name = user.first_name
+        if user.last_name:
+            display_name += f" {user.last_name}"
+    game["player_names"][chat_id] = display_name
 
     # Store token in user_data for the conversation
     context.user_data["current_token"] = token
@@ -205,12 +260,15 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
 
     mood_part = f" Mood: {mood}." if mood else ""
     twist_part = f" Unexpected twist: {twist}." if twist else ""
+    style_prompt = game.get("style_prompt", STYLES[0][1])
+    style_name = game.get("style_name", STYLES[0][0])
+
     image_prompt = (
-        f"Comic book style illustration: {phrase}.{mood_part}{twist_part} "
-        "Vibrant colors, bold outlines, action-packed, dynamic composition."
+        f"{phrase}.{mood_part}{twist_part} "
+        f"{style_prompt}."
     )
 
-    logger.info(f"Generating image for game {token}: {phrase}")
+    logger.info(f"Generating image for game {token} [{style_name}]: {phrase}")
 
     # Generate image with OpenAI
     image_data = None
@@ -222,25 +280,34 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
             prompt=image_prompt,
             n=1,
             size="1024x1024",
-            response_format="b64_json"
+            response_format="b64_json",
         )
-        # gpt-image-1 returns base64 by default
         image_b64 = response.data[0].b64_json
         image_data = base64.b64decode(image_b64)
     except Exception as e:
         logger.error(f"OpenAI image generation failed: {e}")
         error_msg = str(e)
 
+    # Build name lookup
+    names = game.get("player_names", {})
+    player_ids = game["player_order"]
+
+    def name(index):
+        if index < len(player_ids):
+            return f" ({names.get(player_ids[index], 'Player')})"
+        return ""
+
     # Send result to all players
     result_text = (
         f"🎉 <b>Game complete!</b>\n\n"
+        f"🎨 Style: <b>{style_name}</b>\n\n"
         f"📖 <b>The story:</b>\n"
         f"<i>{phrase}</i>\n\n"
-        f"🎭 WHO: {who}\n"
-        f"🎬 ACTION: {action}\n"
-        f"📍 WHERE: {where}"
-        + (f"\n🌫️ MOOD: {mood}" if mood else "")
-        + (f"\n🌀 TWIST: {twist}" if twist else "")
+        f"🎭 WHO: {who}{name(0)}\n"
+        f"🎬 ACTION: {action}{name(1)}\n"
+        f"📍 WHERE: {where}{name(2)}"
+        + (f"\n🌫️ MOOD: {mood}{name(3)}" if mood else "")
+        + (f"\n🌀 TWIST: {twist}{name(4)}" if twist else "")
     )
 
     for chat_id in game["player_order"]:
@@ -261,18 +328,10 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
         except Exception as e:
             logger.error(f"Failed to send result to {chat_id}: {e}")
 
-    # Clean up game after a delay (keep it for any late messages)
-    # Games naturally expire via is_game_expired check
-
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Cancelled.")
     return ConversationHandler.END
-
-
-async def private_only(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private":
-        await update.message.reply_text("⚠️ This bot only works in private chats.")
 
 
 def main():
@@ -283,7 +342,19 @@ def main():
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    conv_handler = ConversationHandler(
+    create_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("create", create_game_start, filters=filters.ChatType.PRIVATE)],
+        states={
+            WAITING_FOR_STYLE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, receive_style)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_user=True,
+        per_chat=True,
+    )
+
+    play_conv_handler = ConversationHandler(
         entry_points=[CommandHandler("play", play_game, filters=filters.ChatType.PRIVATE)],
         states={
             WAITING_FOR_ANSWER: [
@@ -295,8 +366,8 @@ def main():
         per_chat=True,
     )
 
-    app.add_handler(CommandHandler("create", create_game, filters=filters.ChatType.PRIVATE))
-    app.add_handler(conv_handler)
+    app.add_handler(create_conv_handler)
+    app.add_handler(play_conv_handler)
 
     logger.info("Bot is running...")
     app.run_polling()
