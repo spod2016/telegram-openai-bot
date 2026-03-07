@@ -34,11 +34,13 @@ games: dict = {}
 # ConversationHandler state
 WAITING_FOR_ANSWER = 1
 
-ROLES = ["WHO", "WHAT ARE THEY DOING", "WHERE"]
+ROLES = ["WHO", "WHAT ARE THEY DOING", "WHERE", "MOOD", "TWIST"]
 ROLE_QUESTIONS = [
     "🎭 You are the WHO. Who is the main character? (reply with a person or character)",
     "🎬 You are the ACTION. What are they doing? (reply with an action or activity)",
     "📍 You are the WHERE. Where does it happen? (reply with a location or place)",
+    "🌫️ You are the MOOD. What is the atmosphere or tone? (reply with a mood or feeling, e.g. eerie, joyful, tense)",
+    "🌀 You are the TWIST. Add an unexpected detail! (reply with something surprising or bizarre)",
 ]
 GAME_TIMEOUT_MINUTES = 30
 
@@ -85,11 +87,11 @@ async def create_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔑 Token: <code>{token}</code>\n"
         f"👥 Players needed: {n}\n\n"
         f"Share this token with {n - 1} other player(s).\n"
-        f"Everyone (including you) should use:\n"
-        f"<code>/play {token}</code>\n\n"
+        f"Everyone (including you) should use the command below.\n\n"
         f"⏳ This game expires in {GAME_TIMEOUT_MINUTES} minutes.",
         parse_mode="HTML",
     )
+    await update.message.reply_text(f"/play {token}")
 
 
 async def play_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -192,10 +194,19 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
     who = ordered_answers[0]
     action = ordered_answers[1] if len(ordered_answers) > 1 else "doing something"
     where = ordered_answers[2] if len(ordered_answers) > 2 else "somewhere"
+    mood = ordered_answers[3] if len(ordered_answers) > 3 else None
+    twist = ordered_answers[4] if len(ordered_answers) > 4 else None
 
     phrase = f"{who} is {action} in {where}"
+    if mood:
+        phrase += f", with a {mood} atmosphere"
+    if twist:
+        phrase += f", but {twist}"
+
+    mood_part = f" Mood: {mood}." if mood else ""
+    twist_part = f" Unexpected twist: {twist}." if twist else ""
     image_prompt = (
-        f"Comic book style illustration: {phrase}. "
+        f"Comic book style illustration: {phrase}.{mood_part}{twist_part} "
         "Vibrant colors, bold outlines, action-packed, dynamic composition."
     )
 
@@ -228,6 +239,8 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
         f"🎭 WHO: {who}\n"
         f"🎬 ACTION: {action}\n"
         f"📍 WHERE: {where}"
+        + (f"\n🌫️ MOOD: {mood}" if mood else "")
+        + (f"\n🌀 TWIST: {twist}" if twist else "")
     )
 
     for chat_id in game["player_order"]:
