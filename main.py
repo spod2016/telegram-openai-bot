@@ -2,6 +2,8 @@ import logging
 import random
 import string
 import base64
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import os
@@ -334,11 +336,30 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_health_server():
+    server = HTTPServer(("0.0.0.0", 8080), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info("Health check server running on port 8080")
+
+
 def main():
     if not TELEGRAM_TOKEN:
         raise ValueError("TELEGRAM_TOKEN not set in environment")
     if not OPENAI_API_KEY:
         raise ValueError("OPENAI_API_KEY not set in environment")
+
+    start_health_server()
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
