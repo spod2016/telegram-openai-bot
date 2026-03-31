@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import os
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -103,12 +103,12 @@ async def receive_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     if not text.isdigit() or not (1 <= int(text) <= 10):
-        await update.message.reply_text("⚠️ Please reply with a number between 1 and 10.")
+        await update.message.reply_text("❌ Please reply with a number between 1 and 10.")
         return WAITING_FOR_STYLE
 
     style_index = int(text) - 1
     style_name, style_prompt = STYLES[style_index]
-    n = context.user_data.get("pending_num_players", 2)
+    n = context.user_data["pending_num_players"]
 
     token = generate_token()
     while token in games:
@@ -123,22 +123,97 @@ async def receive_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "player_names": {},
         "created_at": datetime.utcnow(),
         "finished": False,
-        "style_name": style_name,
         "style_prompt": style_prompt,
+        "style_name": style_name,
     }
+
+    bot_username = context.bot.username
+    deep_link = f"https://t.me/{bot_username}?start={token}"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            text="📤 Share game invite",
+            url=f"https://t.me/share/url?url={deep_link}&text=Join+my+game!+Tap+the+link+to+play."
+        )],
+        [InlineKeyboardButton(
+            text="▶️ Join this game yourself",
+            url=deep_link
+        )]
+    ])
 
     await update.message.reply_text(
         f"✅ Game created!\n\n"
         f"🔑 Token: <code>{token}</code>\n"
         f"👥 Players needed: {n}\n"
         f"🎨 Style: <b>{style_name}</b>\n\n"
-        f"Share this token with {n - 1} other player(s).\n"
-        f"Everyone (including you) should use the command below.\n\n"
+        f"Tap <b>Share game invite</b> to send the join link to other players.\n\n"
         f"⏳ This game expires in {GAME_TIMEOUT_MINUTES} minutes.",
         parse_mode="HTML",
+        reply_markup=keyboard
     )
-    await update.message.reply_text(f"/play {token}")
     return ConversationHandler.END
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "👋 Welcome! Use /create N to start a new game (N = number of players, 2–5)."
+        )
+        return
+
+    token = args[0].upper()
+    chat_id = update.effective_chat.id
+
+    if token not in games:
+        await update.message.reply_text("❌ Game not found. It may have expired. Ask the host to create a new one.")
+        return
+
+    game = games[token]
+
+    if is_game_expired(game):
+        del games[token]
+        await update.message.reply_text("⏰ This game has expired. Ask the host to create a new one.")
+        return
+
+    if game["finished"]:
+        await update.message.reply_text("🏁 This game is already complete.")
+        return
+
+    if chat_id in game["player_order"]:
+        await update.message.reply_text("⚠️ You've already joined this game!")
+        return
+
+    if len(game["player_order"]) >= game["num_players"]:
+        await update.message.reply_text("🚫 Game is complete. No more players can join.")
+        return
+
+    role_index = len(game["player_order"])
+    game["player_order"].append(chat_id)
+    game["roles"][chat_id] = role_index
+
+    user = update.effective_user
+    if user.username:
+        display_name = f"@{user.username}"
+    else:
+        display_name = user.first_name
+        if user.last_name:
+            display_name += f" {user.last_name}"
+    game["player_names"][chat_id] = display_name
+
+    context.user_data["current_token"] = token
+
+    await update.message.reply_text(
+        f"🎮 You joined game <code>{token}</code>!\n\n"
+        f"Your role: <b>{ROLES[role_index]}</b>\n\n"
+        f"{ROLE_QUESTIONS[role_index]}",
+        parse_mode="HTML",
+    )
+
+    return WAITING_FOR_ANSWER
 
 
 async def play_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -376,7 +451,10 @@ def main():
     )
 
     play_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("play", play_game, filters=filters.ChatType.PRIVATE)],
+        entry_points=[
+            CommandHandler("play", play_game, filters=filters.ChatType.PRIVATE),
+            CommandHandler("start", start, filters=filters.ChatType.PRIVATE),
+        ],
         states={
             WAITING_FOR_ANSWER: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, receive_answer)
