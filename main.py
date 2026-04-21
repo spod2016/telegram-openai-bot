@@ -584,8 +584,8 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(f"✅ Got it! Generating panel {panel_num}… 🎨 (this takes ~15 seconds)")
 
     # Generate panel image
-    prompt     = _build_panel_prompt(comic, scene_text, panel_num)
-    image_data = await _generate_image(prompt, label=f"panel {panel_num} of game {token}")
+    prompt = _build_panel_prompt(comic, scene_text, panel_num)
+    image_data, image_error = await _generate_image(prompt, label=f"panel {panel_num} of game {token}")
 
     # Store panel
     comic["panels"].append({
@@ -612,7 +612,11 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
             else:
                 await context.bot.send_message(
                     chat_id=pid,
-                    text=panel_caption + "\n⚠️ Image generation failed for this panel.",
+                    text=(
+                        panel_caption
+                        + "\n\n⚠️ <b>Image generation failed for this panel.</b>\n"
+                        + (image_error or "Unknown error.")
+                    ),
                     parse_mode="HTML",
                 )
         except Exception as e:
@@ -715,7 +719,7 @@ async def compile_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
         f"movie poster quality, all main characters visible."
     )
 
-    cover_image_data = await _generate_image(cover_prompt, label=f"cover of {token}")
+    cover_image_data, cover_error = await _generate_image(cover_prompt, label=f"cover of {token}")
 
     # Send cover to everyone
     for pid in player_order:
@@ -781,7 +785,7 @@ async def compile_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
 # Shared image generation helper
 # ---------------------------------------------------------------------------
 
-async def _generate_image(prompt: str, label: str = "") -> bytes | None:
+async def _generate_image(prompt: str, label: str = "") -> tuple[bytes | None, str | None]:
     logger.info(f"Generating image [{label}]: {prompt[:120]}")
     try:
         client = AsyncOpenAI(api_key=OPENAI_API_KEY)
@@ -792,10 +796,40 @@ async def _generate_image(prompt: str, label: str = "") -> bytes | None:
             size="1024x1024",
             response_format="b64_json",
         )
-        return base64.b64decode(response.data[0].b64_json)
+        return base64.b64decode(response.data[0].b64_json), None
     except Exception as e:
         logger.error(f"Image generation failed [{label}]: {e}")
-        return None
+        return None, _summarize_image_error(e)
+
+
+def _summarize_image_error(err: Exception) -> str:
+    """Return a short, user-friendly description of a DALL-E error."""
+    msg = str(err)
+    low = msg.lower()
+
+    # Try to pull a clean message from the OpenAI error body if present
+    inner = getattr(err, "message", None) or msg
+    if isinstance(inner, str) and len(inner) > 200:
+        inner = inner[:200] + "…"
+
+    if "content_policy" in low or "safety" in low or "rejected" in low:
+        return "🚫 Blocked by content policy — the scene was flagged as unsafe. Try a tamer description."
+    if "rate limit" in low or "429" in low:
+        return "⏳ Rate limit hit — too many image requests too quickly. Wait a moment and try again."
+    if "billing" in low or "quota" in low or "insufficient_quota" in low:
+        return "💳 OpenAI billing/quota issue — the account is out of credits or the plan limit was reached."
+    if "invalid_api_key" in low or "incorrect api key" in low or "401" in low:
+        return "🔑 Invalid OpenAI API key."
+    if "timeout" in low or "timed out" in low:
+        return "⌛ OpenAI request timed out."
+    if "connection" in low or "network" in low:
+        return "🌐 Network error reaching OpenAI."
+    if "server_error" in low or "500" in low or "503" in low:
+        return "🛠️ OpenAI server error — try again in a minute."
+    if "too long" in low or "maximum context" in low or "string_above_max_length" in low:
+        return "📏 Prompt too long — try a shorter scene description."
+
+    return f"⚠️ {inner}"
 
 
 def _build_panel_prompt(comic: dict, scene_text: str, panel_num: int) -> str:
