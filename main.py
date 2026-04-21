@@ -712,11 +712,12 @@ async def compile_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
     )[:400]
 
     cover_prompt = (
-        f"Comic book cover. The story: {comic['original_phrase']}. "
+        f"Cover illustration for the story: {comic['original_phrase']}. "
         f"Key scenes: {scene_summary}. "
-        f"Style: {comic['style_prompt']}. "
-        f"Dramatic cover composition, bold title area at top, "
-        f"movie poster quality, all main characters visible."
+        f"Visual style: {comic['style_prompt']}. "
+        f"A single dramatic cover image, all main characters visible, "
+        f"poster-quality composition. Do NOT create a grid, multiple panels, or split layout — only one image. "
+        f"No text, captions, or title overlays."
     )
 
     cover_image_data, cover_error = await _generate_image(cover_prompt, label=f"cover of {token}")
@@ -841,13 +842,15 @@ def _build_panel_prompt(comic: dict, scene_text: str, panel_num: int) -> str:
             break
 
     return (
-        f"Sequential comic book panel {panel_num} of {comic['num_panels']}. "
+        f"Scene {panel_num} of {comic['num_panels']} from an ongoing story. "
         f"Established story: {comic['original_phrase']}. "
         f"{previous}"
         f"Current scene: {scene_text}. "
         f"Visual style: {comic['style_prompt']}. "
-        f"Maintain consistent characters, colour palette, and art style throughout. "
-        f"Single clear scene, comic panel composition, no text or speech bubbles."
+        f"A single, self-contained illustration of just this one scene. "
+        f"Do NOT create a comic page, grid, multiple panels, or split layout — only one image. "
+        f"Maintain consistent characters and colour palette with previous scenes. "
+        f"No text, captions, speech bubbles, or borders."
     )
 
 
