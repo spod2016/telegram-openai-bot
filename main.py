@@ -584,8 +584,13 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(f"✅ Got it! Generating panel {panel_num}… 🎨 (this takes ~15 seconds)")
 
     # Generate panel image
-    prompt = _build_panel_prompt(comic, scene_text, panel_num)
-    image_data, image_error = await _generate_image(prompt, label=f"panel {panel_num} of game {token}")
+    prompt   = _build_panel_prompt(comic, scene_text, panel_num)
+    fallback = _build_panel_fallback_prompt(comic, scene_text)
+    image_data, image_error = await _generate_image(
+        prompt,
+        label=f"panel {panel_num} of game {token}",
+        fallback_prompt=fallback,
+    )
 
     # Store panel
     comic["panels"].append({
@@ -678,7 +683,22 @@ async def _advance_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
     if comic["current_turn_index"] >= comic["num_panels"]:
         if not comic["compiling"]:
             comic["compiling"] = True
-            await compile_comic(context, token)
+            try:
+                await compile_comic(context, token)
+            except Exception as e:
+                logger.exception(f"compile_comic crashed for {token}: {e}")
+                for pid in comic.get("player_order", []):
+                    try:
+                        await context.bot.send_message(
+                            chat_id=pid,
+                            text=(
+                                "⚠️ Something went wrong while compiling the comic. "
+                                f"Error: {e}\n\nStart a new game with /create."
+                            ),
+                        )
+                    except Exception:
+                        pass
+                comic_sessions.pop(token, None)
     else:
         await notify_next_comic_player(context, token)
 
@@ -712,15 +732,21 @@ async def compile_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
     )[:400]
 
     cover_prompt = (
-        f"Cover illustration for the story: {comic['original_phrase']}. "
-        f"Key scenes: {scene_summary}. "
+        f"A single dramatic cover illustration showing the key scenes: {scene_summary}. "
         f"Visual style: {comic['style_prompt']}. "
-        f"A single dramatic cover image, all main characters visible, "
-        f"poster-quality composition. Do NOT create a grid, multiple panels, or split layout — only one image. "
+        f"All main characters visible, poster-quality composition. "
+        f"Do NOT create a grid, multiple panels, or split layout — only one image. "
         f"No text, captions, or title overlays."
     )
+    cover_fallback = (
+        f"A single dramatic poster illustration. "
+        f"Visual style: {comic['style_prompt']}. "
+        f"One image only, no text, no panels, no grid."
+    )
 
-    cover_image_data, cover_error = await _generate_image(cover_prompt, label=f"cover of {token}")
+    cover_image_data, cover_error = await _generate_image(
+        cover_prompt, label=f"cover of {token}", fallback_prompt=cover_fallback,
+    )
 
     # Send cover to everyone
     for pid in player_order:
@@ -732,6 +758,16 @@ async def compile_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
                     caption=(
                         f"🎨 <b>COVER</b> · {comic['style_name']}\n"
                         f"<i>{comic['original_phrase']}</i>"
+                    ),
+                    parse_mode="HTML",
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=pid,
+                    text=(
+                        f"🎨 <b>COVER</b> · {comic['style_name']}\n\n"
+                        f"⚠️ Cover image generation failed.\n"
+                        f"{cover_error or 'Unknown error.'}"
                     ),
                     parse_mode="HTML",
                 )
@@ -786,21 +822,41 @@ async def compile_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
 # Shared image generation helper
 # ---------------------------------------------------------------------------
 
-async def _generate_image(prompt: str, label: str = "") -> tuple[bytes | None, str | None]:
-    logger.info(f"Generating image [{label}]: {prompt[:120]}")
-    try:
-        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+async def _generate_image(prompt: str, label: str = "", fallback_prompt: str | None = None) -> tuple[bytes | None, str | None]:
+    """Generate an image. If the prompt is rejected by content policy and a
+    fallback_prompt is provided, retry once with that simpler prompt."""
+    logger.info(f"Generating image [{label}]: {prompt[:200]}")
+    client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+    async def _try(p: str):
         response = await client.images.generate(
             model="dall-e-3",
-            prompt=prompt,
+            prompt=p,
             n=1,
             size="1024x1024",
             response_format="b64_json",
         )
-        return base64.b64decode(response.data[0].b64_json), None
+        return base64.b64decode(response.data[0].b64_json)
+
+    try:
+        return await _try(prompt), None
     except Exception as e:
         logger.error(f"Image generation failed [{label}]: {e}")
+        # Retry with a safer fallback if the failure looks like a content-policy hit
+        if fallback_prompt and _is_content_policy_error(e):
+            logger.info(f"Retrying [{label}] with fallback prompt")
+            try:
+                return await _try(fallback_prompt), None
+            except Exception as e2:
+                logger.error(f"Fallback also failed [{label}]: {e2}")
+                return None, _summarize_image_error(e2)
         return None, _summarize_image_error(e)
+
+
+def _is_content_policy_error(err: Exception) -> bool:
+    low = str(err).lower()
+    return ("content_policy" in low or "safety" in low
+            or "rejected" in low or "your request was rejected" in low)
 
 
 def _summarize_image_error(err: Exception) -> str:
@@ -834,23 +890,31 @@ def _summarize_image_error(err: Exception) -> str:
 
 
 def _build_panel_prompt(comic: dict, scene_text: str, panel_num: int) -> str:
-    # Include the last scene for continuity
+    # Include only the last scene for continuity (kept short to reduce
+    # the chance of accidentally tripping the content filter)
     previous = ""
     for p in reversed(comic["panels"]):
         if not p.get("skipped"):
-            previous = f"Previous scene: {p['prompt']}. "
+            previous = f"Previous scene was: {p['prompt'][:120]}. "
             break
 
     return (
-        f"Scene {panel_num} of {comic['num_panels']} from an ongoing story. "
-        f"Established story: {comic['original_phrase']}. "
         f"{previous}"
-        f"Current scene: {scene_text}. "
+        f"Now illustrate this scene: {scene_text}. "
         f"Visual style: {comic['style_prompt']}. "
         f"A single, self-contained illustration of just this one scene. "
         f"Do NOT create a comic page, grid, multiple panels, or split layout — only one image. "
-        f"Maintain consistent characters and colour palette with previous scenes. "
+        f"Keep characters and colour palette consistent with the previous scene. "
         f"No text, captions, speech bubbles, or borders."
+    )
+
+
+def _build_panel_fallback_prompt(comic: dict, scene_text: str) -> str:
+    """Minimal, safer prompt used as a retry if the full prompt is blocked."""
+    return (
+        f"A single illustration of this scene: {scene_text}. "
+        f"Visual style: {comic['style_prompt']}. "
+        f"One image only, no text, no panels, no grid."
     )
 
 
