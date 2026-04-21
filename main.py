@@ -358,23 +358,16 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
     style_name   = game.get("style_name",   STYLES[0][0])
 
     image_prompt = f"{phrase}.{mood_part}{twist_part} {style_prompt}."
-    logger.info(f"Generating image for game {token} [{style_name}]: {phrase}")
-
-    image_data = None
-    error_msg  = None
-    try:
-        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-        response = await client.images.generate(
-            model="dall-e-3",
-            prompt=image_prompt,
-            n=1,
-            size="1024x1024",
-            response_format="b64_json",
-        )
-        image_data = base64.b64decode(response.data[0].b64_json)
-    except Exception as e:
-        logger.error(f"OpenAI image generation failed: {e}")
-        error_msg = str(e)
+    fallback_prompt = (
+        f"A single illustration of: {phrase}. "
+        f"Visual style: {style_prompt}. "
+        f"One image only, no text."
+    )
+    image_data, error_msg = await _generate_image(
+        image_prompt,
+        label=f"game {token} [{style_name}]",
+        fallback_prompt=fallback_prompt,
+    )
 
     names      = game.get("player_names", {})
     player_ids = game["player_order"]
@@ -408,7 +401,11 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
             else:
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=result_text + f"\n\n⚠️ Image generation failed: {error_msg}",
+                    text=(
+                        result_text
+                        + "\n\n⚠️ <b>Image generation failed.</b>\n"
+                        + (error_msg or "Unknown error.")
+                    ),
                     parse_mode="HTML",
                 )
         except Exception as e:
