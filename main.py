@@ -8,11 +8,12 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import os
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ConversationHandler,
     ContextTypes,
     filters,
@@ -30,13 +31,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global game state
+# ---------------------------------------------------------------------------
+# Global state
+# ---------------------------------------------------------------------------
 games: dict = {}
+comic_sessions: dict = {}
+pending_comic_input: dict = {}  # chat_id -> token, for free-text comic turns
 
+# ---------------------------------------------------------------------------
 # ConversationHandler states
+# ---------------------------------------------------------------------------
 WAITING_FOR_STYLE = 1
 WAITING_FOR_ANSWER = 2
 
+# ---------------------------------------------------------------------------
+# Game config
+# ---------------------------------------------------------------------------
 ROLES = ["WHO", "WHAT ARE THEY DOING", "WHERE", "MOOD", "TWIST"]
 ROLE_QUESTIONS = [
     "🎭 You are the WHO. Who is the main character? (reply with a person or character)",
@@ -47,20 +57,24 @@ ROLE_QUESTIONS = [
 ]
 
 STYLES = [
-    ("Comic Book", "comic book style, vibrant colors, bold outlines, halftone dots, action panels"),
-    ("Watercolor", "soft watercolor illustration, pastel tones, flowing washes, delicate brushstrokes"),
-    ("Pixel Art", "retro pixel art, 16-bit style, chunky pixels, game sprite aesthetic"),
-    ("Oil Painting", "classical oil painting, rich textures, dramatic lighting, old masters style"),
-    ("Anime", "anime style, clean linework, expressive characters, colorful cel shading"),
-    ("Noir", "black and white noir, high contrast, dramatic shadows, film noir atmosphere"),
-    ("Surrealist", "surrealist dreamscape, Salvador Dali inspired, melting reality, bizarre imagery"),
-    ("Cyberpunk", "cyberpunk aesthetic, neon lights, dark dystopian city, futuristic glowing elements"),
+    ("Comic Book",      "comic book style, vibrant colors, bold outlines, halftone dots, action panels"),
+    ("Watercolor",      "soft watercolor illustration, pastel tones, flowing washes, delicate brushstrokes"),
+    ("Pixel Art",       "retro pixel art, 16-bit style, chunky pixels, game sprite aesthetic"),
+    ("Oil Painting",    "classical oil painting, rich textures, dramatic lighting, old masters style"),
+    ("Anime",           "anime style, clean linework, expressive characters, colorful cel shading"),
+    ("Noir",            "black and white noir, high contrast, dramatic shadows, film noir atmosphere"),
+    ("Surrealist",      "surrealist dreamscape, Salvador Dali inspired, melting reality, bizarre imagery"),
+    ("Cyberpunk",       "cyberpunk aesthetic, neon lights, dark dystopian city, futuristic glowing elements"),
     ("Children's Book", "children's book illustration, cute, warm, simple shapes, friendly characters"),
-    ("Renaissance", "Renaissance painting style, classical composition, chiaroscuro lighting, museum quality"),
+    ("Renaissance",     "Renaissance painting style, classical composition, chiaroscuro lighting, museum quality"),
 ]
 
 GAME_TIMEOUT_MINUTES = 30
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def generate_token(length=6) -> str:
     return "".join(random.choices(string.ascii_uppercase, k=length))
@@ -78,6 +92,19 @@ def build_style_menu() -> str:
     return "\n".join(lines)
 
 
+def display_name_for(user) -> str:
+    if user.username:
+        return f"@{user.username}"
+    name = user.first_name
+    if user.last_name:
+        name += f" {user.last_name}"
+    return name
+
+
+# ---------------------------------------------------------------------------
+# /create flow
+# ---------------------------------------------------------------------------
+
 async def create_game_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         await update.message.reply_text("⚠️ This bot only works in private chats.")
@@ -94,7 +121,6 @@ async def create_game_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     context.user_data["pending_num_players"] = n
-
     await update.message.reply_text(build_style_menu(), parse_mode="HTML")
     return WAITING_FOR_STYLE
 
@@ -125,6 +151,7 @@ async def receive_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "finished": False,
         "style_prompt": style_prompt,
         "style_name": style_name,
+        "original_phrase": None,
     }
 
     bot_username = context.bot.username
@@ -133,12 +160,12 @@ async def receive_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(
             text="📤 Share game invite",
-            url=f"https://t.me/share/url?url={deep_link}&text=Join+my+game!+Tap+the+link+to+play."
+            url=f"https://t.me/share/url?url={deep_link}&text=Join+my+game!+Tap+the+link+to+play.",
         )],
         [InlineKeyboardButton(
             text="▶️ Join this game yourself",
-            url=deep_link
-        )]
+            url=deep_link,
+        )],
     ])
 
     await update.message.reply_text(
@@ -149,9 +176,23 @@ async def receive_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Tap <b>Share game invite</b> to send the join link to other players.\n\n"
         f"⏳ This game expires in {GAME_TIMEOUT_MINUTES} minutes.",
         parse_mode="HTML",
-        reply_markup=keyboard
+        reply_markup=keyboard,
     )
     return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# /start deep-link join  &  /play join
+# ---------------------------------------------------------------------------
+
+def _join_game(game, token, chat_id, user, context):
+    """Shared logic for joining a game. Returns role_index or raises."""
+    role_index = len(game["player_order"])
+    game["player_order"].append(chat_id)
+    game["roles"][chat_id] = role_index
+    game["player_names"][chat_id] = display_name_for(user)
+    context.user_data["current_token"] = token
+    return role_index
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -161,7 +202,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
         await update.message.reply_text(
-            "👋 Welcome! Use /create N to start a new game (N = number of players, 2–5)."
+            "👋 Welcome to Plotshot!\n\nUse /create N to start a new game (N = number of players, 2–5)."
         )
         return
 
@@ -188,23 +229,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if len(game["player_order"]) >= game["num_players"]:
-        await update.message.reply_text("🚫 Game is complete. No more players can join.")
+        await update.message.reply_text("🚫 Game is full. No more players can join.")
         return
 
-    role_index = len(game["player_order"])
-    game["player_order"].append(chat_id)
-    game["roles"][chat_id] = role_index
-
-    user = update.effective_user
-    if user.username:
-        display_name = f"@{user.username}"
-    else:
-        display_name = user.first_name
-        if user.last_name:
-            display_name += f" {user.last_name}"
-    game["player_names"][chat_id] = display_name
-
-    context.user_data["current_token"] = token
+    role_index = _join_game(game, token, chat_id, update.effective_user, context)
 
     await update.message.reply_text(
         f"🎮 You joined game <code>{token}</code>!\n\n"
@@ -212,7 +240,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{ROLE_QUESTIONS[role_index]}",
         parse_mode="HTML",
     )
-
     return WAITING_FOR_ANSWER
 
 
@@ -249,26 +276,10 @@ async def play_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if len(game["player_order"]) >= game["num_players"]:
-        await update.message.reply_text("🚫 Game is complete. No more players can join.")
+        await update.message.reply_text("🚫 Game is full. No more players can join.")
         return ConversationHandler.END
 
-    # Assign role
-    role_index = len(game["player_order"])
-    game["player_order"].append(chat_id)
-    game["roles"][chat_id] = role_index
-
-    # Store player display name
-    user = update.effective_user
-    if user.username:
-        display_name = f"@{user.username}"
-    else:
-        display_name = user.first_name
-        if user.last_name:
-            display_name += f" {user.last_name}"
-    game["player_names"][chat_id] = display_name
-
-    # Store token in user_data for the conversation
-    context.user_data["current_token"] = token
+    role_index = _join_game(game, token, chat_id, update.effective_user, context)
 
     await update.message.reply_text(
         f"🎮 You joined game <code>{token}</code>!\n\n"
@@ -276,9 +287,12 @@ async def play_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{ROLE_QUESTIONS[role_index]}",
         parse_mode="HTML",
     )
-
     return WAITING_FOR_ANSWER
 
+
+# ---------------------------------------------------------------------------
+# Answer collection
+# ---------------------------------------------------------------------------
 
 async def receive_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -307,27 +321,27 @@ async def receive_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game["answers"][chat_id] = answer
     await update.message.reply_text("✅ Answer received! Waiting for other players...")
 
-    # Check if all players have answered
     if len(game["answers"]) == game["num_players"]:
         await finalize_game(context, token)
 
     return ConversationHandler.END
 
 
+# ---------------------------------------------------------------------------
+# Finalize regular game → generate image → offer comic mode
+# ---------------------------------------------------------------------------
+
 async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
     game = games[token]
     game["finished"] = True
 
-    # Build prompt in role order
-    ordered_answers = []
-    for chat_id in game["player_order"]:
-        ordered_answers.append(game["answers"][chat_id])
+    ordered_answers = [game["answers"][cid] for cid in game["player_order"]]
 
-    who = ordered_answers[0]
+    who    = ordered_answers[0]
     action = ordered_answers[1] if len(ordered_answers) > 1 else "doing something"
-    where = ordered_answers[2] if len(ordered_answers) > 2 else "somewhere"
-    mood = ordered_answers[3] if len(ordered_answers) > 3 else None
-    twist = ordered_answers[4] if len(ordered_answers) > 4 else None
+    where  = ordered_answers[2] if len(ordered_answers) > 2 else "somewhere"
+    mood   = ordered_answers[3] if len(ordered_answers) > 3 else None
+    twist  = ordered_answers[4] if len(ordered_answers) > 4 else None
 
     phrase = f"{who} is {action} in {where}"
     if mood:
@@ -335,21 +349,19 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
     if twist:
         phrase += f", but {twist}"
 
-    mood_part = f" Mood: {mood}." if mood else ""
+    # Store for comic continuity
+    game["original_phrase"] = phrase
+
+    mood_part  = f" Mood: {mood}."  if mood  else ""
     twist_part = f" Unexpected twist: {twist}." if twist else ""
     style_prompt = game.get("style_prompt", STYLES[0][1])
-    style_name = game.get("style_name", STYLES[0][0])
+    style_name   = game.get("style_name",   STYLES[0][0])
 
-    image_prompt = (
-        f"{phrase}.{mood_part}{twist_part} "
-        f"{style_prompt}."
-    )
-
+    image_prompt = f"{phrase}.{mood_part}{twist_part} {style_prompt}."
     logger.info(f"Generating image for game {token} [{style_name}]: {phrase}")
 
-    # Generate image with OpenAI
     image_data = None
-    error_msg = None
+    error_msg  = None
     try:
         client = AsyncOpenAI(api_key=OPENAI_API_KEY)
         response = await client.images.generate(
@@ -359,14 +371,12 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
             size="1024x1024",
             response_format="b64_json",
         )
-        image_b64 = response.data[0].b64_json
-        image_data = base64.b64decode(image_b64)
+        image_data = base64.b64decode(response.data[0].b64_json)
     except Exception as e:
         logger.error(f"OpenAI image generation failed: {e}")
         error_msg = str(e)
 
-    # Build name lookup
-    names = game.get("player_names", {})
+    names      = game.get("player_names", {})
     player_ids = game["player_order"]
 
     def name(index):
@@ -374,7 +384,6 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
             return f" ({names.get(player_ids[index], 'Player')})"
         return ""
 
-    # Send result to all players
     result_text = (
         f"🎉 <b>Game complete!</b>\n\n"
         f"🎨 Style: <b>{style_name}</b>\n\n"
@@ -383,11 +392,11 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
         f"🎭 WHO: {who}{name(0)}\n"
         f"🎬 ACTION: {action}{name(1)}\n"
         f"📍 WHERE: {where}{name(2)}"
-        + (f"\n🌫️ MOOD: {mood}{name(3)}" if mood else "")
-        + (f"\n🌀 TWIST: {twist}{name(4)}" if twist else "")
+        + (f"\n🌫️ MOOD: {mood}{name(3)}"   if mood  else "")
+        + (f"\n🌀 TWIST: {twist}{name(4)}"  if twist else "")
     )
 
-    for chat_id in game["player_order"]:
+    for chat_id in player_ids:
         try:
             if image_data:
                 await context.bot.send_photo(
@@ -405,11 +414,423 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
         except Exception as e:
             logger.error(f"Failed to send result to {chat_id}: {e}")
 
+    # Offer comic mode to the HOST only
+    host_id = player_ids[0]
+    comic_keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🎬 Continue as Comic Book!", callback_data=f"start_comic:{token}"),
+    ]])
+    await context.bot.send_message(
+        chat_id=host_id,
+        text=(
+            "✨ <b>Want to keep going?</b>\n\n"
+            "Start a comic book based on this story — each player writes a scene "
+            "and the bot generates a panel. At the end everyone gets the full comic!"
+        ),
+        parse_mode="HTML",
+        reply_markup=comic_keyboard,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Comic mode — start & round selection
+# ---------------------------------------------------------------------------
+
+async def start_comic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    token = query.data.split(":", 1)[1]
+
+    game = games.get(token)
+    if not game:
+        await query.edit_message_text("❌ Game not found or expired.")
+        return
+
+    if token in comic_sessions:
+        await query.edit_message_text("🎬 A comic book for this game has already started!")
+        return
+
+    n = len(game["player_order"])
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"1 round  ({n} panels)",   callback_data=f"comic_rounds:{token}:1"),
+        InlineKeyboardButton(f"2 rounds ({n*2} panels)", callback_data=f"comic_rounds:{token}:2"),
+        InlineKeyboardButton(f"3 rounds ({n*3} panels)", callback_data=f"comic_rounds:{token}:3"),
+    ]])
+    await query.edit_message_text(
+        f"🎬 <b>Comic Book Mode</b>\n\n"
+        f"How many rounds should the comic run?\n"
+        f"({n} players, {n} panels per round)",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+async def set_comic_rounds_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    _, token, rounds_str = query.data.split(":")
+    rounds = int(rounds_str)
+
+    game = games.get(token)
+    if not game:
+        await query.edit_message_text("❌ Game not found.")
+        return
+
+    if token in comic_sessions:
+        await query.edit_message_text("🎬 Already started!")
+        return
+
+    num_panels = len(game["player_order"]) * rounds
+
+    comic_sessions[token] = {
+        "style_prompt":     game["style_prompt"],
+        "style_name":       game["style_name"],
+        "original_phrase":  game.get("original_phrase", ""),
+        "player_order":     list(game["player_order"]),
+        "player_names":     dict(game["player_names"]),
+        "current_turn_index": 0,
+        "panels":           [],
+        "num_panels":       num_panels,
+        "rounds":           rounds,
+        "created_at":       datetime.utcnow(),
+        "compiling":        False,
+    }
+
+    await query.edit_message_text(
+        f"🎬 <b>Comic Book started!</b>\n"
+        f"{rounds} round(s) · {num_panels} panels total.\n\n"
+        f"Players will be notified when it's their turn.",
+        parse_mode="HTML",
+    )
+
+    host_id = query.from_user.id
+    # Notify non-host players
+    for chat_id in game["player_order"]:
+        if chat_id != host_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"🎬 <b>Comic Book Mode has started!</b>\n\n"
+                        f"{rounds} round(s) · {num_panels} panels.\n"
+                        f"You'll be pinged when it's your turn. Stay close! 🖊️"
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify player {chat_id}: {e}")
+
+    await notify_next_comic_player(context, token)
+
+
+# ---------------------------------------------------------------------------
+# Comic mode — turn management
+# ---------------------------------------------------------------------------
+
+async def notify_next_comic_player(context: ContextTypes.DEFAULT_TYPE, token: str):
+    comic = comic_sessions.get(token)
+    if not comic:
+        return
+
+    idx          = comic["current_turn_index"]
+    player_order = comic["player_order"]
+    player_id    = player_order[idx % len(player_order)]
+    panel_num    = idx + 1
+
+    # Register player as awaiting input
+    pending_comic_input[player_id] = token
+
+    # Build story-so-far summary
+    story_lines = [f"<i>{comic['original_phrase']}</i>"]
+    for i, panel in enumerate(comic["panels"]):
+        if not panel.get("skipped"):
+            author = comic["player_names"].get(panel["author_id"], "Someone")
+            story_lines.append(f"  Panel {i+1} ({author}): {panel['prompt']}")
+
+    story_text = "\n".join(story_lines)
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⏭️ Skip my turn", callback_data=f"skip_scene:{token}"),
+    ]])
+
+    await context.bot.send_message(
+        chat_id=player_id,
+        text=(
+            f"🎬 <b>Your turn! Panel {panel_num} of {comic['num_panels']}</b>\n\n"
+            f"📖 <b>Story so far:</b>\n{story_text}\n\n"
+            f"✍️ Describe what happens in the next scene:\n"
+            f"<i>(or tap Skip if you're stuck)</i>"
+        ),
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Catches free-text from players whose turn it is in a comic session."""
+    chat_id = update.effective_chat.id
+
+    if chat_id not in pending_comic_input:
+        return  # Not this player's comic turn — let other handlers deal with it
+
+    token = pending_comic_input.pop(chat_id)
+    comic = comic_sessions.get(token)
+    if not comic:
+        return
+
+    scene_text = update.message.text.strip()
+    panel_num  = comic["current_turn_index"] + 1
+
+    await update.message.reply_text(f"✅ Got it! Generating panel {panel_num}… 🎨 (this takes ~15 seconds)")
+
+    # Generate panel image
+    prompt     = _build_panel_prompt(comic, scene_text, panel_num)
+    image_data = await _generate_image(prompt, label=f"panel {panel_num} of game {token}")
+
+    # Store panel
+    comic["panels"].append({
+        "author_id":  chat_id,
+        "prompt":     scene_text,
+        "image_data": image_data,
+        "skipped":    False,
+    })
+
+    # Broadcast panel to all players
+    author_name   = comic["player_names"].get(chat_id, "A player")
+    panel_caption = (
+        f"🎬 <b>Panel {panel_num} of {comic['num_panels']}</b> — by {author_name}\n"
+        f"<i>{scene_text}</i>"
+    )
+
+    for pid in comic["player_order"]:
+        try:
+            if image_data:
+                await context.bot.send_photo(
+                    chat_id=pid, photo=image_data,
+                    caption=panel_caption, parse_mode="HTML",
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=pid,
+                    text=panel_caption + "\n⚠️ Image generation failed for this panel.",
+                    parse_mode="HTML",
+                )
+        except Exception as e:
+            logger.error(f"Failed to broadcast panel {panel_num} to {pid}: {e}")
+
+    await _advance_comic(context, token)
+
+
+async def skip_comic_scene_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Turn skipped ⏭️")
+
+    token   = query.data.split(":", 1)[1]
+    chat_id = query.from_user.id
+
+    # Remove from pending input in case they hadn't started typing
+    pending_comic_input.pop(chat_id, None)
+
+    comic = comic_sessions.get(token)
+    if not comic:
+        return
+
+    panel_num   = comic["current_turn_index"] + 1
+    author_name = comic["player_names"].get(chat_id, "A player")
+
+    comic["panels"].append({
+        "author_id":  chat_id,
+        "prompt":     "[skipped]",
+        "image_data": None,
+        "skipped":    True,
+    })
+
+    for pid in comic["player_order"]:
+        try:
+            await context.bot.send_message(
+                chat_id=pid,
+                text=f"⏭️ {author_name} skipped Panel {panel_num}.",
+            )
+        except Exception:
+            pass
+
+    # Remove the skip button from the message
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await _advance_comic(context, token)
+
+
+async def _advance_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
+    """Increment turn counter and either prompt next player or compile the comic."""
+    comic = comic_sessions.get(token)
+    if not comic:
+        return
+
+    comic["current_turn_index"] += 1
+
+    if comic["current_turn_index"] >= comic["num_panels"]:
+        if not comic["compiling"]:
+            comic["compiling"] = True
+            await compile_comic(context, token)
+    else:
+        await notify_next_comic_player(context, token)
+
+
+# ---------------------------------------------------------------------------
+# Comic compilation — cover panel + album
+# ---------------------------------------------------------------------------
+
+async def compile_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
+    comic = comic_sessions.get(token)
+    if not comic:
+        return
+
+    player_order = comic["player_order"]
+    player_names = comic["player_names"]
+
+    # Notify all players that compilation is starting
+    for pid in player_order:
+        try:
+            await context.bot.send_message(
+                chat_id=pid,
+                text="📖 <b>All panels done! Generating your comic book cover…</b> 🎨",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.error(f"Failed to send compile notice to {pid}: {e}")
+
+    # Build cover prompt from all scene texts
+    scene_summary = "; ".join(
+        p["prompt"] for p in comic["panels"] if not p.get("skipped")
+    )[:400]
+
+    cover_prompt = (
+        f"Comic book cover. The story: {comic['original_phrase']}. "
+        f"Key scenes: {scene_summary}. "
+        f"Style: {comic['style_prompt']}. "
+        f"Dramatic cover composition, bold title area at top, "
+        f"movie poster quality, all main characters visible."
+    )
+
+    cover_image_data = await _generate_image(cover_prompt, label=f"cover of {token}")
+
+    # Send cover to everyone
+    for pid in player_order:
+        try:
+            if cover_image_data:
+                await context.bot.send_photo(
+                    chat_id=pid,
+                    photo=cover_image_data,
+                    caption=(
+                        f"🎨 <b>COVER</b> · {comic['style_name']}\n"
+                        f"<i>{comic['original_phrase']}</i>"
+                    ),
+                    parse_mode="HTML",
+                )
+        except Exception as e:
+            logger.error(f"Failed to send cover to {pid}: {e}")
+
+    # Send panel album (Telegram allows max 10 per media group)
+    real_panels = [(i, p) for i, p in enumerate(comic["panels"]) if p.get("image_data")]
+
+    for chunk_start in range(0, len(real_panels), 10):
+        chunk = real_panels[chunk_start:chunk_start + 10]
+        media_group = []
+        for orig_idx, panel in chunk:
+            author = player_names.get(panel["author_id"], "Player")
+            media_group.append(
+                InputMediaPhoto(
+                    media=panel["image_data"],
+                    caption=f"Panel {orig_idx + 1} — {author}\n\"{panel['prompt']}\"",
+                    parse_mode="HTML",
+                )
+            )
+        for pid in player_order:
+            try:
+                await context.bot.send_media_group(chat_id=pid, media=media_group)
+            except Exception as e:
+                logger.error(f"Failed to send album chunk to {pid}: {e}")
+
+    # Credits & closing message
+    credits = "\n".join(f"• {player_names[pid]}" for pid in player_order)
+    for pid in player_order:
+        try:
+            await context.bot.send_message(
+                chat_id=pid,
+                text=(
+                    f"🎉 <b>The End!</b>\n\n"
+                    f"🎨 Style: {comic['style_name']}\n"
+                    f"📖 {len(real_panels)} panels · {comic['rounds']} round(s)\n\n"
+                    f"<b>Created by:</b>\n{credits}\n\n"
+                    f"Thanks for playing <b>Plotshot</b>! 🚀\n"
+                    f"Start a new game anytime with /create"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.error(f"Failed to send credits to {pid}: {e}")
+
+    # Clean up session
+    comic_sessions.pop(token, None)
+
+
+# ---------------------------------------------------------------------------
+# Shared image generation helper
+# ---------------------------------------------------------------------------
+
+async def _generate_image(prompt: str, label: str = "") -> bytes | None:
+    logger.info(f"Generating image [{label}]: {prompt[:120]}")
+    try:
+        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        response = await client.images.generate(
+            model="dall-e-3",
+            prompt=prompt,
+            n=1,
+            size="1024x1024",
+            response_format="b64_json",
+        )
+        return base64.b64decode(response.data[0].b64_json)
+    except Exception as e:
+        logger.error(f"Image generation failed [{label}]: {e}")
+        return None
+
+
+def _build_panel_prompt(comic: dict, scene_text: str, panel_num: int) -> str:
+    # Include the last scene for continuity
+    previous = ""
+    for p in reversed(comic["panels"]):
+        if not p.get("skipped"):
+            previous = f"Previous scene: {p['prompt']}. "
+            break
+
+    return (
+        f"Sequential comic book panel {panel_num} of {comic['num_panels']}. "
+        f"Established story: {comic['original_phrase']}. "
+        f"{previous}"
+        f"Current scene: {scene_text}. "
+        f"Visual style: {comic['style_prompt']}. "
+        f"Maintain consistent characters, colour palette, and art style throughout. "
+        f"Single clear scene, comic panel composition, no text or speech bubbles."
+    )
+
+
+# ---------------------------------------------------------------------------
+# /cancel
+# ---------------------------------------------------------------------------
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    pending_comic_input.pop(chat_id, None)
     await update.message.reply_text("❌ Cancelled.")
     return ConversationHandler.END
 
+
+# ---------------------------------------------------------------------------
+# Health-check server (Replit keep-alive)
+# ---------------------------------------------------------------------------
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -428,6 +849,10 @@ def start_health_server():
     logger.info("Health check server running on port 8080")
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
     if not TELEGRAM_TOKEN:
         raise ValueError("TELEGRAM_TOKEN not set in environment")
@@ -438,6 +863,7 @@ def main():
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
+    # --- Conversation: /create ---
     create_conv_handler = ConversationHandler(
         entry_points=[CommandHandler("create", create_game_start, filters=filters.ChatType.PRIVATE)],
         states={
@@ -450,10 +876,11 @@ def main():
         per_chat=True,
     )
 
+    # --- Conversation: /play and deep-link /start ---
     play_conv_handler = ConversationHandler(
         entry_points=[
-            CommandHandler("play", play_game, filters=filters.ChatType.PRIVATE),
-            CommandHandler("start", start, filters=filters.ChatType.PRIVATE),
+            CommandHandler("play",  play_game, filters=filters.ChatType.PRIVATE),
+            CommandHandler("start", start,     filters=filters.ChatType.PRIVATE),
         ],
         states={
             WAITING_FOR_ANSWER: [
@@ -465,10 +892,23 @@ def main():
         per_chat=True,
     )
 
+    # Group 0 (default, highest priority) — conversation handlers
     app.add_handler(create_conv_handler)
     app.add_handler(play_conv_handler)
 
-    logger.info("Bot is running...")
+    # Callback query handlers for comic flow
+    app.add_handler(CallbackQueryHandler(start_comic_callback,      pattern=r"^start_comic:"))
+    app.add_handler(CallbackQueryHandler(set_comic_rounds_callback, pattern=r"^comic_rounds:"))
+    app.add_handler(CallbackQueryHandler(skip_comic_scene_callback, pattern=r"^skip_scene:"))
+
+    # Group 1 (lower priority) — catches plain text for comic turns
+    # Runs only when no ConversationHandler in group 0 claims the message
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_comic_message),
+        group=1,
+    )
+
+    logger.info("Plotshot bot is running…")
     app.run_polling()
 
 
