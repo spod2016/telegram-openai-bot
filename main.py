@@ -391,7 +391,7 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
         return ""
 
     result_text = (
-        f"🎉 <b>Game complete!</b>\n\n"
+        f"🎬 <b>Your story begins!</b>\n\n"
         f"🎨 Style: <b>{style_name}</b>\n\n"
         f"📖 <b>The story:</b>\n"
         f"<i>{phrase}</i>\n\n"
