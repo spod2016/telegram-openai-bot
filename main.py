@@ -162,7 +162,7 @@ async def receive_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(
             text="📤 Share game invite",
-            url=f"https://t.me/share/url?text=Let%27s%20make%20a%20comic%20together%21%20Join%20my%20Plotshot%20game%20%E2%80%94%20takes%20just%20minutes%2C%20guaranteed%20to%20be%20ridiculous%20%F0%9F%91%87&url={deep_link}",
+            url=f"https://t.me/share/url?text=Let%27s%20make%20a%20comic%20together%21%20Join%20my%20Skazk.AI%20game%20%E2%80%94%20takes%20just%20minutes%2C%20guaranteed%20to%20be%20ridiculous%20%F0%9F%91%87&url={deep_link}",
         )],
         [InlineKeyboardButton(
             text="▶️ Join this game yourself",
@@ -204,7 +204,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
         await update.message.reply_text(
-            "👋 Welcome to Plotshot!\n\nUse /create N to start a new game (N = number of players, 2–5)."
+            "👋 Welcome to Skazk.AI!\n\nUse /create N to start a new game (N = number of players, 2–5)."
         )
         return
 
@@ -835,7 +835,7 @@ async def compile_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
                     chat_id=pid,
                     photo=strip_bytes,
                     caption=(
-                        f"📖 <b>Your Plotshot comic — {comic['style_name']}</b>\n"
+                        f"📖 <b>Your Skazk.AI comic — {comic['style_name']}</b>\n"
                         f"<i>{comic['original_phrase']}</i>"
                     ),
                     parse_mode="HTML",
@@ -892,7 +892,7 @@ async def compile_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
                     f"🎨 Style: {comic['style_name']}\n"
                     f"📖 {len(real_panels)} panels · {comic['rounds']} round(s)\n\n"
                     f"<b>Created by:</b>\n{credits}\n\n"
-                    f"Thanks for playing <b>Plotshot</b>! 🚀\n"
+                    f"Thanks for playing <b>Skazk.AI</b>! 🚀\n"
                     f"Start a new game anytime with /create"
                 ),
                 parse_mode="HTML",
@@ -1341,7 +1341,7 @@ def main():
         group=1,
     )
 
-    logger.info("Plotshot bot is running…")
+    logger.info("Skazk.AI bot is running…")
     app.run_polling()
 
 
