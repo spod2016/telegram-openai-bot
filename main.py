@@ -1141,7 +1141,7 @@ async def _generate_image(
 
     async def _try(p: str):
         response = await client.images.generate(
-            model="gpt-image-1.5",
+            model="gpt-image-2",
             prompt=p,
             n=1,
             size="1024x1024",
