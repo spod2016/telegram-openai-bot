@@ -791,9 +791,30 @@ async def compile_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
             except Exception as e:
                 logger.error(f"Failed to send album chunk to {pid}: {e}")
 
+    # Build full script
+    script_lines = [
+        "📜 <b>Full Comic Script</b>\n",
+        f"<b>Origin</b>\n<i>{comic['original_phrase']}</i>",
+    ]
+    for i, p in enumerate(comic["panels"]):
+        author = player_names.get(p["author_id"], "Player")
+        if p.get("skipped"):
+            script_lines.append(f"\n<b>Panel {i + 1}</b> — {author}\n<i>[skipped]</i>")
+        else:
+            script_lines.append(f"\n<b>Panel {i + 1}</b> — {author}\n<i>{p['prompt']}</i>")
+    script_text = "\n".join(script_lines)
+
     # Credits & closing message
     credits = "\n".join(f"• {player_names[pid]}" for pid in player_order)
     for pid in player_order:
+        try:
+            await context.bot.send_message(
+                chat_id=pid,
+                text=script_text,
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.error(f"Failed to send script to {pid}: {e}")
         try:
             await context.bot.send_message(
                 chat_id=pid,
