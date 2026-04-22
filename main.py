@@ -2,6 +2,8 @@ import logging
 import random
 import string
 import base64
+import io
+import textwrap
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
@@ -186,7 +188,7 @@ async def receive_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 def _join_game(game, token, chat_id, user, context):
-    """Shared logic for joining a game. Returns role_index or raises."""
+    """Shared logic for joining a game. Returns role_index."""
     role_index = len(game["player_order"])
     game["player_order"].append(chat_id)
     game["roles"][chat_id] = role_index
@@ -488,20 +490,22 @@ async def set_comic_rounds_callback(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text("🎬 Already started!")
         return
 
-    num_panels = len(game["player_order"]) * rounds
+    num_players = len(game["player_order"])
+    num_panels  = num_players * rounds
 
     comic_sessions[token] = {
-        "style_prompt":     game["style_prompt"],
-        "style_name":       game["style_name"],
-        "original_phrase":  game.get("original_phrase", ""),
-        "player_order":     list(game["player_order"]),
-        "player_names":     dict(game["player_names"]),
+        "style_prompt":       game["style_prompt"],
+        "style_name":         game["style_name"],
+        "original_phrase":    game.get("original_phrase", ""),
+        "player_order":       list(game["player_order"]),
+        "player_names":       dict(game["player_names"]),
+        "num_players":        num_players,
         "current_turn_index": 0,
-        "panels":           [],
-        "num_panels":       num_panels,
-        "rounds":           rounds,
-        "created_at":       datetime.utcnow(),
-        "compiling":        False,
+        "panels":             [],
+        "num_panels":         num_panels,
+        "rounds":             rounds,
+        "created_at":         datetime.utcnow(),
+        "compiling":          False,
     }
 
     await query.edit_message_text(
@@ -514,13 +518,12 @@ async def set_comic_rounds_callback(update: Update, context: ContextTypes.DEFAUL
     host_id = query.from_user.id
 
     # Reuse the character bible already generated during finalize_game
-    # so panels are consistent with the very first image.
     character_bible = game.get("character_bible", "")
     comic_sessions[token]["character_bible"] = character_bible
     if character_bible:
         logger.info(f"Reusing character bible for comic {token}: {character_bible}")
 
-    # Carry the initial image forward so compile_comic can include it as panel 0
+    # Carry the initial image forward so compile_comic can include it
     comic_sessions[token]["initial_image_data"] = game.get("initial_image_data")
 
     # Notify non-host players
@@ -656,7 +659,6 @@ async def skip_comic_scene_callback(update: Update, context: ContextTypes.DEFAUL
     token   = query.data.split(":", 1)[1]
     chat_id = query.from_user.id
 
-    # Remove from pending input in case they hadn't started typing
     pending_comic_input.pop(chat_id, None)
 
     comic = comic_sessions.get(token)
@@ -682,7 +684,6 @@ async def skip_comic_scene_callback(update: Update, context: ContextTypes.DEFAUL
         except Exception:
             pass
 
-    # Remove the skip button from the message
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
@@ -723,7 +724,7 @@ async def _advance_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
 
 
 # ---------------------------------------------------------------------------
-# Comic compilation — cover panel + album
+# Comic compilation
 # ---------------------------------------------------------------------------
 
 async def compile_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
@@ -775,6 +776,32 @@ async def compile_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
         comic_sessions.pop(token, None)
         return
 
+    # --- 1. Send the composite strip image ---
+    strip_bytes = _build_comic_strip(
+        initial_image_data=comic.get("initial_image_data"),
+        panels=comic["panels"],
+        player_names=player_names,
+        original_phrase=comic["original_phrase"],
+        style_name=comic["style_name"],
+        num_players=comic["num_players"],
+    )
+
+    for pid in player_order:
+        try:
+            if strip_bytes:
+                await context.bot.send_photo(
+                    chat_id=pid,
+                    photo=strip_bytes,
+                    caption=(
+                        f"📖 <b>Your Plotshot comic — {comic['style_name']}</b>\n"
+                        f"<i>{comic['original_phrase']}</i>"
+                    ),
+                    parse_mode="HTML",
+                )
+        except Exception as e:
+            logger.error(f"Failed to send strip to {pid}: {e}")
+
+    # --- 2. Send individual panel album (full resolution) ---
     for chunk_start in range(0, len(real_panels), 10):
         chunk = real_panels[chunk_start:chunk_start + 10]
         media_group = [
@@ -791,7 +818,7 @@ async def compile_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
             except Exception as e:
                 logger.error(f"Failed to send album chunk to {pid}: {e}")
 
-    # Build full script
+    # --- 3. Full script ---
     script_lines = [
         "📜 <b>Full Comic Script</b>\n",
         f"<b>Origin</b>\n<i>{comic['original_phrase']}</i>",
@@ -804,7 +831,7 @@ async def compile_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
             script_lines.append(f"\n<b>Panel {i + 1}</b> — {author}\n<i>{p['prompt']}</i>")
     script_text = "\n".join(script_lines)
 
-    # Credits & closing message
+    # --- 4. Credits & closing ---
     credits = "\n".join(f"• {player_names[pid]}" for pid in player_order)
     for pid in player_order:
         try:
@@ -836,12 +863,235 @@ async def compile_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
 
 
 # ---------------------------------------------------------------------------
+# Comic strip compositor
+# ---------------------------------------------------------------------------
+
+def _build_comic_strip(
+    initial_image_data: bytes | None,
+    panels: list[dict],
+    player_names: dict,
+    original_phrase: str,
+    style_name: str,
+    num_players: int,
+) -> bytes | None:
+    """
+    Build a single composite image of the full comic.
+
+    Layout:
+      - Origin image spans the full canvas width at the top
+      - Comic panels below in a grid where COLS = num_players
+        so each row = one round of the game
+      - Every cell has a caption strip with panel number, author, prompt
+
+    Works for all player/round combinations:
+      2p × 1r =  2 panels  → 1 row  of 2
+      2p × 3r =  6 panels  → 3 rows of 2
+      3p × 2r =  6 panels  → 2 rows of 3
+      5p × 3r = 15 panels  → 3 rows of 5
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        logger.error("Pillow not installed — cannot build comic strip. Run: pip install Pillow")
+        return None
+
+    try:
+        # ── Design constants ────────────────────────────────────────────────
+        COLS        = num_players          # columns = players (each row = 1 round)
+        PANEL_SIZE  = _panel_size(COLS)    # adaptive square panel size
+        CAPTION_H   = 100                  # caption area height below each panel
+        PAD         = 14                   # gap between cells and canvas edges
+        ORIGIN_H    = PANEL_SIZE + CAPTION_H  # origin cell height
+
+        # Colours
+        BG          = (18, 18, 26)
+        CAPTION_BG  = (32, 32, 46)
+        BORDER      = (70, 55, 110)
+        ORIGIN_BG   = (26, 22, 40)
+        C_LABEL     = (180, 140, 255)      # purple — panel label
+        C_AUTHOR    = (140, 200, 255)      # blue   — author name
+        C_TEXT      = (210, 210, 210)      # light grey — prompt text
+        C_ORIGIN_LBL= (255, 200, 80)       # gold   — "ORIGIN" label
+
+        # ── Fonts ───────────────────────────────────────────────────────────
+        font_bold, font_reg, font_small = _load_fonts()
+
+        # ── Canvas dimensions ───────────────────────────────────────────────
+        canvas_w = COLS * PANEL_SIZE + (COLS + 1) * PAD
+
+        # Count real (non-skipped) panels
+        real_comic_panels = [p for p in panels if not p.get("skipped") and p.get("image_data")]
+        n_comic = len(real_comic_panels)
+        rows    = max(1, -(-n_comic // COLS))  # ceiling division
+
+        origin_block_h = ORIGIN_H + 2 * PAD  # origin + top/bottom padding
+        grid_h         = rows * (PANEL_SIZE + CAPTION_H + PAD) + PAD
+        canvas_h       = origin_block_h + grid_h
+
+        canvas = Image.new("RGB", (canvas_w, canvas_h), BG)
+        draw   = ImageDraw.Draw(canvas)
+
+        # ── Draw origin image ────────────────────────────────────────────────
+        ox = PAD
+        oy = PAD
+        ow = canvas_w - 2 * PAD
+        oh = ORIGIN_H
+
+        if initial_image_data:
+            orig_img = Image.open(io.BytesIO(initial_image_data)).convert("RGB")
+            # Fill width, crop height from center so it doesn't letterbox
+            orig_img = _resize_cover(orig_img, ow, oh)
+        else:
+            orig_img = Image.new("RGB", (ow, oh), ORIGIN_BG)
+
+        canvas.paste(orig_img, (ox, oy))
+
+        # Origin caption overlay at the bottom of the image
+        cap_y = oy + oh - CAPTION_H
+        draw.rectangle([ox, cap_y, ox + ow, oy + oh], fill=(0, 0, 0, 0))
+        # Semi-transparent dark bar (Pillow RGB — simulate with a dark fill)
+        draw.rectangle([ox, cap_y, ox + ow, oy + oh], fill=(15, 12, 24))
+        draw.text((ox + 10, cap_y + 6),  "⬛ ORIGIN",   font=font_bold,  fill=C_ORIGIN_LBL)
+        _draw_wrapped(draw, original_phrase, ox + 10, cap_y + 28, ow - 20, 3, font_small, C_TEXT)
+
+        # Border
+        draw.rectangle([ox - 2, oy - 2, ox + ow + 1, oy + oh + 1], outline=BORDER, width=3)
+
+        # ── Draw comic panels in grid ────────────────────────────────────────
+        grid_top = origin_block_h
+
+        for idx, panel in enumerate(real_comic_panels):
+            col = idx % COLS
+            row = idx // COLS
+
+            px = PAD + col * (PANEL_SIZE + PAD)
+            py = grid_top + PAD + row * (PANEL_SIZE + CAPTION_H + PAD)
+
+            # Panel image
+            pimg = Image.open(io.BytesIO(panel["image_data"])).convert("RGB")
+            pimg = pimg.resize((PANEL_SIZE, PANEL_SIZE), Image.LANCZOS)
+            canvas.paste(pimg, (px, py))
+
+            # Border
+            draw.rectangle(
+                [px - 2, py - 2, px + PANEL_SIZE + 1, py + PANEL_SIZE + 1],
+                outline=BORDER, width=2,
+            )
+
+            # Caption area
+            cy = py + PANEL_SIZE
+            draw.rectangle([px, cy, px + PANEL_SIZE, cy + CAPTION_H], fill=CAPTION_BG)
+
+            # Find original panel index (for numbering — skipped panels shift things)
+            orig_num = panels.index(panel) + 1
+            author   = player_names.get(panel["author_id"], "Player")
+
+            draw.text((px + 8, cy + 5),  f"Panel {orig_num}", font=font_bold,  fill=C_LABEL)
+            _draw_wrapped(draw, panel["prompt"], px + 8, cy + 24, PANEL_SIZE - 16, 3, font_small, C_TEXT)
+
+        # ── Serialise ────────────────────────────────────────────────────────
+        buf = io.BytesIO()
+        canvas.save(buf, format="JPEG", quality=90)
+        logger.info(f"Comic strip built: {canvas_w}×{canvas_h}px, "
+                    f"{n_comic} panels, {COLS} cols")
+        return buf.getvalue()
+
+    except Exception as e:
+        logger.error(f"_build_comic_strip failed: {e}", exc_info=True)
+        return None
+
+
+def _panel_size(cols: int) -> int:
+    """
+    Return a panel size (pixels) so the final image stays under ~1600px wide.
+    Aim for ~300px per panel; scale down if needed for wide grids.
+
+    cols  panel_size  canvas_width (approx)
+      2      340          708
+      3      320         1006
+      4      300         1228
+      5      280         1428
+    """
+    sizes = {2: 340, 3: 320, 4: 300, 5: 280}
+    return sizes.get(cols, 280)
+
+
+def _resize_cover(img: "Image.Image", target_w: int, target_h: int) -> "Image.Image":
+    """Scale + center-crop an image to exactly (target_w × target_h)."""
+    src_w, src_h = img.size
+    scale = max(target_w / src_w, target_h / src_h)
+    new_w = int(src_w * scale)
+    new_h = int(src_h * scale)
+    img   = img.resize((new_w, new_h), Image.LANCZOS)
+    left  = (new_w - target_w) // 2
+    top   = (new_h - target_h) // 2
+    return img.crop((left, top, left + target_w, top + target_h))
+
+
+def _draw_wrapped(
+    draw: "ImageDraw.ImageDraw",
+    text: str,
+    x: int, y: int,
+    max_w: int,
+    max_lines: int,
+    font,
+    color: tuple,
+) -> None:
+    """Draw word-wrapped text, truncating with … if it exceeds max_lines."""
+    # Estimate characters per line from max_w and avg char width (~8px for small font)
+    chars_per_line = max(10, max_w // 8)
+    lines = textwrap.wrap(text, width=chars_per_line)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1][:chars_per_line - 1] + "…"
+    for i, line in enumerate(lines):
+        draw.text((x, y + i * 18), line, font=font, fill=color)
+
+
+def _load_fonts():
+    """Try common font paths; fall back to PIL default."""
+    try:
+        from PIL import ImageFont
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        ]
+        bold = reg = small = None
+        for path in candidates:
+            if os.path.exists(path):
+                if "Bold" in path and bold is None:
+                    bold  = ImageFont.truetype(path, 17)
+                    small_bold = ImageFont.truetype(path, 14)
+                elif "Bold" not in path and reg is None:
+                    reg   = ImageFont.truetype(path, 15)
+                    small = ImageFont.truetype(path, 13)
+            if bold and reg:
+                break
+        return (
+            bold  or ImageFont.load_default(),
+            reg   or ImageFont.load_default(),
+            small or ImageFont.load_default(),
+        )
+    except Exception:
+        from PIL import ImageFont
+        d = ImageFont.load_default()
+        return d, d, d
+
+
+# ---------------------------------------------------------------------------
 # Shared image generation helper
 # ---------------------------------------------------------------------------
 
-async def _generate_image(prompt: str, label: str = "", fallback_prompt: str | None = None) -> tuple[bytes | None, str | None]:
-    """Generate an image. If the prompt is rejected by content policy and a
-    fallback_prompt is provided, retry once with that simpler prompt."""
+async def _generate_image(
+    prompt: str,
+    label: str = "",
+    fallback_prompt: str | None = None,
+) -> tuple[bytes | None, str | None]:
+    """Generate an image. Retry once with fallback_prompt on content-policy error."""
     logger.info(f"Generating image [{label}]: {prompt[:200]}")
     client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
@@ -852,14 +1102,12 @@ async def _generate_image(prompt: str, label: str = "", fallback_prompt: str | N
             n=1,
             size="1024x1024",
         )
-        # gpt-image-1 returns b64_json by default
         return base64.b64decode(response.data[0].b64_json)
 
     try:
         return await _try(prompt), None
     except Exception as e:
         logger.error(f"Image generation failed [{label}]: {e}")
-        # Retry with a safer fallback if the failure looks like a content-policy hit
         if fallback_prompt and _is_content_policy_error(e):
             logger.info(f"Retrying [{label}] with fallback prompt")
             try:
@@ -877,21 +1125,18 @@ def _is_content_policy_error(err: Exception) -> bool:
 
 
 def _summarize_image_error(err: Exception) -> str:
-    """Return a short, user-friendly description of a DALL-E error."""
-    msg = str(err)
-    low = msg.lower()
-
-    # Try to pull a clean message from the OpenAI error body if present
+    msg  = str(err)
+    low  = msg.lower()
     inner = getattr(err, "message", None) or msg
     if isinstance(inner, str) and len(inner) > 200:
         inner = inner[:200] + "…"
 
     if "content_policy" in low or "safety" in low or "rejected" in low:
-        return "🚫 Blocked by content policy — the scene was flagged as unsafe. Try a tamer description."
+        return "🚫 Blocked by content policy — try a tamer description."
     if "rate limit" in low or "429" in low:
-        return "⏳ Rate limit hit — too many image requests too quickly. Wait a moment and try again."
+        return "⏳ Rate limit hit — wait a moment and try again."
     if "billing" in low or "quota" in low or "insufficient_quota" in low:
-        return "💳 OpenAI billing/quota issue — the account is out of credits or the plan limit was reached."
+        return "💳 OpenAI billing/quota issue — account out of credits."
     if "invalid_api_key" in low or "incorrect api key" in low or "401" in low:
         return "🔑 Invalid OpenAI API key."
     if "timeout" in low or "timed out" in low:
@@ -902,14 +1147,11 @@ def _summarize_image_error(err: Exception) -> str:
         return "🛠️ OpenAI server error — try again in a minute."
     if "too long" in low or "maximum context" in low or "string_above_max_length" in low:
         return "📏 Prompt too long — try a shorter scene description."
-
     return f"⚠️ {inner}"
 
 
 async def _generate_character_bible(original_phrase: str, style_name: str) -> str:
-    """Use GPT-4o-mini to generate a locked visual character description.
-    This gets injected into every panel prompt so DALL-E renders the same
-    character consistently across all images."""
+    """GPT-4o-mini generates a locked visual character description injected into every prompt."""
     try:
         client = AsyncOpenAI(api_key=OPENAI_API_KEY)
         response = await client.chat.completions.create(
@@ -933,14 +1175,11 @@ async def _generate_character_bible(original_phrase: str, style_name: str) -> st
 
 
 def _build_panel_prompt(comic: dict, scene_text: str, panel_num: int) -> str:
-    # Lock character appearance via the bible generated at comic start
     bible = comic.get("character_bible", "")
     character_anchor = (
         f"Main character (keep exactly consistent): {bible}. "
         if bible else ""
     )
-
-    # One previous scene for narrative continuity
     previous = ""
     for p in reversed(comic["panels"]):
         if not p.get("skipped"):
@@ -961,7 +1200,6 @@ def _build_panel_prompt(comic: dict, scene_text: str, panel_num: int) -> str:
 
 
 def _build_panel_fallback_prompt(comic: dict, scene_text: str) -> str:
-    """Minimal, safer prompt used as a retry if the full prompt is blocked."""
     return (
         f"A single full-bleed illustration of this scene: {scene_text}. "
         f"Art style: {comic['style_prompt']}. "
@@ -1044,7 +1282,7 @@ def main():
         per_chat=True,
     )
 
-    # Group 0 (default, highest priority) — conversation handlers
+    # Group 0 — conversation handlers
     app.add_handler(create_conv_handler)
     app.add_handler(play_conv_handler)
 
@@ -1053,8 +1291,7 @@ def main():
     app.add_handler(CallbackQueryHandler(set_comic_rounds_callback, pattern=r"^comic_rounds:"))
     app.add_handler(CallbackQueryHandler(skip_comic_scene_callback, pattern=r"^skip_scene:"))
 
-    # Group 1 (lower priority) — catches plain text for comic turns
-    # Runs only when no ConversationHandler in group 0 claims the message
+    # Group 1 — catches plain text for comic turns (lower priority)
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_comic_message),
         group=1,
