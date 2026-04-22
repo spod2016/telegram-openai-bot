@@ -162,7 +162,7 @@ async def receive_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(
             text="📤 Share game invite",
-            url=f"https://t.me/share/url?url={deep_link}&text=Join+my+game!+Tap+the+link+to+play.",
+            url=f"https://t.me/share/url?url={deep_link}&text=Let%27s%20make%20a%20comic%20together%21%20Join%20my%20Plotshot%20game%20%E2%80%94%20takes%202%20minutes%2C%20guaranteed%20to%20be%20ridiculous%20%F0%9F%91%87",
         )],
         [InlineKeyboardButton(
             text="▶️ Join this game yourself",
