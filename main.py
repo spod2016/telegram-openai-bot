@@ -595,13 +595,14 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if chat_id not in pending_comic_input:
         return  # Not this player's comic turn — let other handlers deal with it
 
-    token = pending_comic_input.pop(chat_id)
-    comic = comic_sessions.get(token)
+    token      = pending_comic_input.pop(chat_id)
+    comic      = comic_sessions.get(token)
     if not comic:
         return
 
     scene_text = update.message.text.strip()
     panel_num  = comic["current_turn_index"] + 1
+    is_retry   = comic.get("retry_player") == chat_id  # True if this is their second attempt
 
     await update.message.reply_text(f"✅ Got it! Generating panel {panel_num}… 🎨 (this takes ~15 seconds)")
 
@@ -613,6 +614,47 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
         label=f"panel {panel_num} of game {token}",
         fallback_prompt=fallback,
     )
+
+    # Content policy block — offer one retry, then force-skip
+    if image_data is None and image_error and "content policy" in image_error.lower():
+        if not is_retry:
+            # First offence — give them one more chance
+            comic["retry_player"] = chat_id
+            pending_comic_input[chat_id] = token
+            await update.message.reply_text(
+                f"🚫 <b>Content policy violation.</b>\n\n"
+                f"That scene was flagged as unsafe. Please try a tamer description.\n\n"
+                f"⚠️ <i>If your next prompt is blocked again, your turn will be skipped automatically.</i>",
+                parse_mode="HTML",
+            )
+            return
+        else:
+            # Second offence — skip silently
+            comic.pop("retry_player", None)
+            author_name = comic["player_names"].get(chat_id, "A player")
+            for pid in comic["player_order"]:
+                try:
+                    await context.bot.send_message(
+                        chat_id=pid,
+                        text=(
+                            f"⏭️ <b>Panel {panel_num} skipped.</b> "
+                            f"{author_name}'s scene was blocked by content policy twice."
+                        ),
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+            comic["panels"].append({
+                "author_id":  chat_id,
+                "prompt":     "[blocked by content policy]",
+                "image_data": None,
+                "skipped":    True,
+            })
+            await _advance_comic(context, token)
+            return
+
+    # Clear retry flag on success (or non-policy failure)
+    comic.pop("retry_player", None)
 
     # Store panel
     comic["panels"].append({
@@ -951,8 +993,8 @@ def _build_comic_strip(
         draw.rectangle([ox, cap_y, ox + ow, oy + oh], fill=(0, 0, 0, 0))
         # Semi-transparent dark bar (Pillow RGB — simulate with a dark fill)
         draw.rectangle([ox, cap_y, ox + ow, oy + oh], fill=(15, 12, 24))
-        draw.text((ox + 10, cap_y + 6),  "⬛ ORIGIN",   font=font_bold,  fill=C_ORIGIN_LBL)
-        _draw_wrapped(draw, original_phrase, ox + 10, cap_y + 28, ow - 20, 3, font_small, C_TEXT)
+        draw.text((ox + 10, cap_y + 6),  "1.",  font=font_bold,  fill=C_LABEL)
+        _draw_wrapped(draw, original_phrase, ox + 28, cap_y + 6, ow - 38, 3, font_small, C_TEXT)
 
         # Border
         draw.rectangle([ox - 2, oy - 2, ox + ow + 1, oy + oh + 1], outline=BORDER, width=3)
@@ -986,8 +1028,9 @@ def _build_comic_strip(
             orig_num = panels.index(panel) + 1
             author   = player_names.get(panel["author_id"], "Player")
 
-            draw.text((px + 8, cy + 5),  f"Panel {orig_num}", font=font_bold,  fill=C_LABEL)
-            _draw_wrapped(draw, panel["prompt"], px + 8, cy + 24, PANEL_SIZE - 16, 3, font_small, C_TEXT)
+            display_num = orig_num + 1  # origin is 1, so panels start at 2
+            draw.text((px + 8, cy + 5),  f"{display_num}.",  font=font_bold,  fill=C_LABEL)
+            _draw_wrapped(draw, panel["prompt"], px + 26, cy + 5, PANEL_SIZE - 34, 3, font_small, C_TEXT)
 
         # ── Serialise ────────────────────────────────────────────────────────
         buf = io.BytesIO()
