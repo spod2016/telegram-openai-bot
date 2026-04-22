@@ -45,6 +45,7 @@ pending_comic_input: dict = {}  # chat_id -> token, for free-text comic turns
 # ---------------------------------------------------------------------------
 WAITING_FOR_STYLE = 1
 WAITING_FOR_ANSWER = 2
+WAITING_FOR_SOLO_ANSWER = 3
 
 # ---------------------------------------------------------------------------
 # Game config
@@ -114,12 +115,12 @@ async def create_game_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = context.args
     if not args or not args[0].isdigit():
-        await update.message.reply_text("Usage: /create N (where N is between 2 and 5)")
+        await update.message.reply_text("Usage: /create N (where N is between 1 and 5)")
         return ConversationHandler.END
 
     n = int(args[0])
-    if n < 2 or n > 5:
-        await update.message.reply_text("❌ Number of players must be between 2 and 5.")
+    if n < 1 or n > 5:
+        await update.message.reply_text("❌ Number of players must be between 1 and 5.")
         return ConversationHandler.END
 
     context.user_data["pending_num_players"] = n
@@ -138,6 +139,40 @@ async def receive_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
     style_name, style_prompt = STYLES[style_index]
     n = context.user_data["pending_num_players"]
 
+    # Solo mode — auto-join and start asking questions immediately
+    if n == 1:
+        chat_id = update.effective_chat.id
+        token = generate_token()
+        while token in games:
+            token = generate_token()
+
+        games[token] = {
+            "token": token,
+            "num_players": 1,
+            "answers": {},
+            "roles": {},
+            "player_order": [],
+            "player_names": {},
+            "created_at": datetime.utcnow(),
+            "finished": False,
+            "style_prompt": style_prompt,
+            "style_name": style_name,
+            "original_phrase": None,
+            "solo_answers": [],   # ordered list of all 5 answers
+        }
+
+        _join_game(games[token], token, chat_id, update.effective_user, context)
+
+        await update.message.reply_text(
+            f"🎮 <b>Solo game started!</b>\n"
+            f"🎨 Style: <b>{style_name}</b>\n\n"
+            f"You'll answer all 5 questions yourself. Let's go!\n\n"
+            f"{ROLE_QUESTIONS[0]}",
+            parse_mode="HTML",
+        )
+        return WAITING_FOR_SOLO_ANSWER
+
+    # Multiplayer — show invite links as before
     token = generate_token()
     while token in games:
         token = generate_token()
@@ -204,7 +239,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
         await update.message.reply_text(
-            "👋 Welcome to Skazk.AI!\n\nUse /create N to start a new game (N = number of players, 2–5)."
+            "👋 Welcome to Skazk.AI!\n\nUse /create 1 to play solo, or /create N (2–5) to play with friends."
         )
         return
 
@@ -329,6 +364,40 @@ async def receive_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def receive_solo_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the sequential Q&A for solo games."""
+    chat_id = update.effective_chat.id
+    answer  = update.message.text.strip()
+    token   = context.user_data.get("current_token")
+
+    if not token or token not in games:
+        await update.message.reply_text("❌ Something went wrong. Use /create to start a new game.")
+        return ConversationHandler.END
+
+    game = games[token]
+
+    if is_game_expired(game):
+        del games[token]
+        await update.message.reply_text("⏰ This game has expired.")
+        return ConversationHandler.END
+
+    game["solo_answers"].append(answer)
+    role_index = len(game["solo_answers"])  # next question index
+
+    if role_index < len(ROLE_QUESTIONS):
+        # More questions to ask
+        await update.message.reply_text(ROLE_QUESTIONS[role_index])
+        return WAITING_FOR_SOLO_ANSWER
+    else:
+        # All 5 answered — build the answers dict in the expected format
+        # and finalize as if all players submitted
+        for i, ans in enumerate(game["solo_answers"]):
+            game["answers"][chat_id] = ans  # placeholder — finalize reads solo_answers directly
+        await update.message.reply_text("✅ All answers in! Generating your image… 🎨")
+        await finalize_game(context, token)
+        return ConversationHandler.END
+
+
 # ---------------------------------------------------------------------------
 # Finalize regular game → generate image → offer comic mode
 # ---------------------------------------------------------------------------
@@ -337,7 +406,11 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
     game = games[token]
     game["finished"] = True
 
-    ordered_answers = [game["answers"][cid] for cid in game["player_order"]]
+    ordered_answers = (
+        game["solo_answers"]
+        if game.get("num_players") == 1
+        else [game["answers"][cid] for cid in game["player_order"]]
+    )
 
     who    = ordered_answers[0]
     action = ordered_answers[1] if len(ordered_answers) > 1 else "doing something"
@@ -1303,6 +1376,9 @@ def main():
         states={
             WAITING_FOR_STYLE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, receive_style)
+            ],
+            WAITING_FOR_SOLO_ANSWER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, receive_solo_answer)
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
