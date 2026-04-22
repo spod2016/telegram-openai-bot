@@ -357,7 +357,15 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
     style_prompt = game.get("style_prompt", STYLES[0][1])
     style_name   = game.get("style_name",   STYLES[0][0])
 
-    image_prompt = f"{phrase}.{mood_part}{twist_part} {style_prompt}."
+    # Generate the character bible NOW so the initial image and all comic
+    # panels share the exact same character description from the very start.
+    character_bible = await _generate_character_bible(phrase, style_name)
+    game["character_bible"] = character_bible
+    if character_bible:
+        logger.info(f"Character bible for {token}: {character_bible}")
+
+    bible_prefix = f"{character_bible}. " if character_bible else ""
+    image_prompt = f"{bible_prefix}{phrase}.{mood_part}{twist_part} {style_prompt}."
     fallback_prompt = (
         f"A single illustration of: {phrase}. "
         f"Visual style: {style_prompt}. "
@@ -368,6 +376,9 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
         label=f"game {token} [{style_name}]",
         fallback_prompt=fallback_prompt,
     )
+
+    # Keep the initial image so it can be included as panel 0 in the comic book
+    game["initial_image_data"] = image_data
 
     names      = game.get("player_names", {})
     player_ids = game["player_order"]
@@ -502,13 +513,15 @@ async def set_comic_rounds_callback(update: Update, context: ContextTypes.DEFAUL
 
     host_id = query.from_user.id
 
-    # Generate character bible in the background before first turn
-    character_bible = await _generate_character_bible(
-        game.get("original_phrase", ""), game["style_name"]
-    )
+    # Reuse the character bible already generated during finalize_game
+    # so panels are consistent with the very first image.
+    character_bible = game.get("character_bible", "")
     comic_sessions[token]["character_bible"] = character_bible
     if character_bible:
-        logger.info(f"Character bible for {token}: {character_bible}")
+        logger.info(f"Reusing character bible for comic {token}: {character_bible}")
+
+    # Carry the initial image forward so compile_comic can include it as panel 0
+    comic_sessions[token]["initial_image_data"] = game.get("initial_image_data")
 
     # Notify non-host players
     for chat_id in game["player_order"]:
@@ -732,8 +745,23 @@ async def compile_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
         except Exception as e:
             logger.error(f"Failed to send compile notice to {pid}: {e}")
 
-    # Send panel album (Telegram allows max 10 per media group)
-    real_panels = [(i, p) for i, p in enumerate(comic["panels"]) if p.get("image_data")]
+    # Build the full panel list: initial image first, then all comic panels
+    real_panels = []
+    initial = comic.get("initial_image_data")
+    if initial:
+        real_panels.append({
+            "image_data": initial,
+            "label": "🎬 Origin",
+            "caption": f"Panel 0 — Origin\n<i>{comic['original_phrase']}</i>",
+        })
+    for i, p in enumerate(comic["panels"]):
+        if p.get("image_data"):
+            author = player_names.get(p["author_id"], "Player")
+            real_panels.append({
+                "image_data": p["image_data"],
+                "label": f"Panel {i + 1}",
+                "caption": f"Panel {i + 1} — {author}\n<i>{p['prompt']}</i>",
+            })
 
     if not real_panels:
         for pid in player_order:
@@ -749,16 +777,14 @@ async def compile_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
 
     for chunk_start in range(0, len(real_panels), 10):
         chunk = real_panels[chunk_start:chunk_start + 10]
-        media_group = []
-        for orig_idx, panel in chunk:
-            author = player_names.get(panel["author_id"], "Player")
-            media_group.append(
-                InputMediaPhoto(
-                    media=panel["image_data"],
-                    caption=f"Panel {orig_idx + 1} — {author}\n<i>{panel['prompt']}</i>",
-                    parse_mode="HTML",
-                )
+        media_group = [
+            InputMediaPhoto(
+                media=panel["image_data"],
+                caption=panel["caption"],
+                parse_mode="HTML",
             )
+            for panel in chunk
+        ]
         for pid in player_order:
             try:
                 await context.bot.send_media_group(chat_id=pid, media=media_group)
