@@ -501,6 +501,15 @@ async def set_comic_rounds_callback(update: Update, context: ContextTypes.DEFAUL
     )
 
     host_id = query.from_user.id
+
+    # Generate character bible in the background before first turn
+    character_bible = await _generate_character_bible(
+        game.get("original_phrase", ""), game["style_name"]
+    )
+    comic_sessions[token]["character_bible"] = character_bible
+    if character_bible:
+        logger.info(f"Character bible for {token}: {character_bible}")
+
     # Notify non-host players
     for chat_id in game["player_order"]:
         if chat_id != host_id:
@@ -712,67 +721,31 @@ async def compile_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
     player_order = comic["player_order"]
     player_names = comic["player_names"]
 
-    # Notify all players that compilation is starting
+    # Notify all players
     for pid in player_order:
         try:
             await context.bot.send_message(
                 chat_id=pid,
-                text="📖 <b>All panels done! Generating your comic book cover…</b> 🎨",
+                text="📖 <b>All panels done! Putting together your comic book…</b>",
                 parse_mode="HTML",
             )
         except Exception as e:
             logger.error(f"Failed to send compile notice to {pid}: {e}")
 
-    # Build cover prompt from all scene texts
-    scene_summary = "; ".join(
-        p["prompt"] for p in comic["panels"] if not p.get("skipped")
-    )[:400]
-
-    cover_prompt = (
-        f"A single dramatic cover illustration showing the key scenes: {scene_summary}. "
-        f"Visual style: {comic['style_prompt']}. "
-        f"All main characters visible, poster-quality composition. "
-        f"Do NOT create a grid, multiple panels, or split layout — only one image. "
-        f"No text, captions, or title overlays."
-    )
-    cover_fallback = (
-        f"A single dramatic poster illustration. "
-        f"Visual style: {comic['style_prompt']}. "
-        f"One image only, no text, no panels, no grid."
-    )
-
-    cover_image_data, cover_error = await _generate_image(
-        cover_prompt, label=f"cover of {token}", fallback_prompt=cover_fallback,
-    )
-
-    # Send cover to everyone
-    for pid in player_order:
-        try:
-            if cover_image_data:
-                await context.bot.send_photo(
-                    chat_id=pid,
-                    photo=cover_image_data,
-                    caption=(
-                        f"🎨 <b>COVER</b> · {comic['style_name']}\n"
-                        f"<i>{comic['original_phrase']}</i>"
-                    ),
-                    parse_mode="HTML",
-                )
-            else:
-                await context.bot.send_message(
-                    chat_id=pid,
-                    text=(
-                        f"🎨 <b>COVER</b> · {comic['style_name']}\n\n"
-                        f"⚠️ Cover image generation failed.\n"
-                        f"{cover_error or 'Unknown error.'}"
-                    ),
-                    parse_mode="HTML",
-                )
-        except Exception as e:
-            logger.error(f"Failed to send cover to {pid}: {e}")
-
     # Send panel album (Telegram allows max 10 per media group)
     real_panels = [(i, p) for i, p in enumerate(comic["panels"]) if p.get("image_data")]
+
+    if not real_panels:
+        for pid in player_order:
+            try:
+                await context.bot.send_message(
+                    chat_id=pid,
+                    text="⚠️ No panels were generated successfully — all images failed.",
+                )
+            except Exception:
+                pass
+        comic_sessions.pop(token, None)
+        return
 
     for chunk_start in range(0, len(real_panels), 10):
         chunk = real_panels[chunk_start:chunk_start + 10]
@@ -782,7 +755,7 @@ async def compile_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
             media_group.append(
                 InputMediaPhoto(
                     media=panel["image_data"],
-                    caption=f"Panel {orig_idx + 1} — {author}\n\"{panel['prompt']}\"",
+                    caption=f"Panel {orig_idx + 1} — {author}\n<i>{panel['prompt']}</i>",
                     parse_mode="HTML",
                 )
             )
@@ -827,12 +800,12 @@ async def _generate_image(prompt: str, label: str = "", fallback_prompt: str | N
 
     async def _try(p: str):
         response = await client.images.generate(
-            model="dall-e-3",
+            model="gpt-image-1",
             prompt=p,
             n=1,
             size="1024x1024",
-            response_format="b64_json",
         )
+        # gpt-image-1 returns b64_json by default
         return base64.b64decode(response.data[0].b64_json)
 
     try:
@@ -886,32 +859,66 @@ def _summarize_image_error(err: Exception) -> str:
     return f"⚠️ {inner}"
 
 
+async def _generate_character_bible(original_phrase: str, style_name: str) -> str:
+    """Use GPT-4o-mini to generate a locked visual character description.
+    This gets injected into every panel prompt so DALL-E renders the same
+    character consistently across all images."""
+    try:
+        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            max_tokens=120,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Write a short, precise visual description of the main character for an AI image generator. "
+                    f"Story premise: '{original_phrase}'. Art style: {style_name}. "
+                    f"Cover: gender, approximate age, hair colour and style, clothing, one or two "
+                    f"distinctive physical traits. Be specific and concrete so the same character "
+                    f"can be reproduced reliably. 2–3 sentences max. No preamble, just the description."
+                )
+            }]
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.warning(f"Character bible generation failed: {e}")
+        return ""
+
+
 def _build_panel_prompt(comic: dict, scene_text: str, panel_num: int) -> str:
-    # Include only the last scene for continuity (kept short to reduce
-    # the chance of accidentally tripping the content filter)
+    # Lock character appearance via the bible generated at comic start
+    bible = comic.get("character_bible", "")
+    character_anchor = (
+        f"Main character (keep exactly consistent): {bible}. "
+        if bible else ""
+    )
+
+    # One previous scene for narrative continuity
     previous = ""
     for p in reversed(comic["panels"]):
         if not p.get("skipped"):
-            previous = f"Previous scene was: {p['prompt'][:120]}. "
+            previous = f"Previous scene: {p['prompt'][:100]}. "
             break
 
     return (
+        f"{character_anchor}"
         f"{previous}"
-        f"Now illustrate this scene: {scene_text}. "
-        f"Visual style: {comic['style_prompt']}. "
-        f"A single, self-contained illustration of just this one scene. "
-        f"Do NOT create a comic page, grid, multiple panels, or split layout — only one image. "
-        f"Keep characters and colour palette consistent with the previous scene. "
-        f"No text, captions, speech bubbles, or borders."
+        f"Scene to illustrate: {scene_text}. "
+        f"Art style: {comic['style_prompt']}. "
+        f"IMPORTANT: single standalone full-bleed illustration of ONE scene only. "
+        f"Absolutely NO comic-book page layout, NO panel grid, NO split screen, "
+        f"NO multiple sub-images side by side, NO sequential strips. "
+        f"One continuous scene filling the whole image. "
+        f"No text, captions, speech bubbles, or panel borders anywhere."
     )
 
 
 def _build_panel_fallback_prompt(comic: dict, scene_text: str) -> str:
     """Minimal, safer prompt used as a retry if the full prompt is blocked."""
     return (
-        f"A single illustration of this scene: {scene_text}. "
-        f"Visual style: {comic['style_prompt']}. "
-        f"One image only, no text, no panels, no grid."
+        f"A single full-bleed illustration of this scene: {scene_text}. "
+        f"Art style: {comic['style_prompt']}. "
+        f"One image only, no text, no panels, no grid, no split layout."
     )
 
 
