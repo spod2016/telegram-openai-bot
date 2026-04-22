@@ -1016,8 +1016,9 @@ def _panel_size(cols: int) -> int:
     return sizes.get(cols, 280)
 
 
-def _resize_cover(img: "Image.Image", target_w: int, target_h: int) -> "Image.Image":
+def _resize_cover(img, target_w: int, target_h: int):
     """Scale + center-crop an image to exactly (target_w × target_h)."""
+    from PIL import Image
     src_w, src_h = img.size
     scale = max(target_w / src_w, target_h / src_h)
     new_w = int(src_w * scale)
