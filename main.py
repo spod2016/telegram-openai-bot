@@ -26,7 +26,7 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")
+NOVELAI_API_KEY = os.getenv("NOVELAI_API_KEY")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -75,8 +75,8 @@ STYLES = [
     ("Renaissance",     "Renaissance painting style, classical composition, chiaroscuro lighting, museum quality"),
 ]
 
-# Adult style — separate entry, uses Stability AI
-ADULT_STYLE = ("🔞 Adult", "explicit adult content, highly detailed, sensual illustration")
+# Adult style — separate entry, uses NovelAI
+ADULT_STYLE = ("🔞 Anime Adult", "explicit adult anime content, highly detailed, sensual illustration")
 
 ADULT_STYLE_PROMPT_SUFFIX = (
     "explicit adult content, highly detailed, mature themes, sensual, erotic illustration. "
@@ -155,7 +155,7 @@ async def receive_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Adult mode selected — ask host for age confirmation first
     if choice == 11:
-        if not STABILITY_API_KEY:
+        if not NOVELAI_API_KEY:
             await update.message.reply_text(
                 "⚠️ Adult mode is not configured on this server. "
                 "Please choose a style from 1–10."
@@ -1354,34 +1354,61 @@ def _load_fonts():
 # ---------------------------------------------------------------------------
 
 async def _generate_image_adult(prompt: str, label: str = "") -> tuple[bytes | None, str | None]:
-    """Generate adult content image via Stability AI Core model."""
+    """Generate adult anime image via NovelAI image generation API."""
     import httpx
-    logger.info(f"Generating adult image [{label}]: {prompt[:200]}")
-    if not STABILITY_API_KEY:
-        return None, "⚠️ Stability AI key not configured."
+    logger.info(f"Generating adult image via NovelAI [{label}]: {prompt[:200]}")
+    if not NOVELAI_API_KEY:
+        return None, "⚠️ NovelAI API key not configured."
     try:
-        async with httpx.AsyncClient(timeout=90) as client:
+        # NovelAI image generation endpoint
+        payload = {
+            "input": prompt,
+            "model": "nai-diffusion-4-5",   # latest NovelAI anime model
+            "action": "generate",
+            "parameters": {
+                "width": 1024,
+                "height": 1024,
+                "scale": 6.0,               # guidance scale
+                "sampler": "k_euler_ancestral",
+                "steps": 28,
+                "n_samples": 1,
+                "ucPreset": 0,
+                "qualityToggle": True,
+                "sm": False,
+                "sm_dyn": False,
+                "dynamic_thresholding": False,
+                "controlnet_strength": 1.0,
+                "legacy": False,
+                "add_original_image": False,
+                "uncond_scale": 1.0,
+                "cfg_rescale": 0.0,
+                "noise_schedule": "karras",
+                "legacy_v3_extend": False,
+            },
+        }
+        async with httpx.AsyncClient(timeout=120) as client:
             response = await client.post(
-                "https://api.stability.ai/v2beta/stable-image/generate/core",
+                "https://image.novelai.net/ai/generate-image",
                 headers={
-                    "authorization": f"Bearer {STABILITY_API_KEY}",
-                    "accept": "image/*",
+                    "authorization": f"Bearer {NOVELAI_API_KEY}",
+                    "content-type": "application/json",
+                    "accept": "application/zip",
                 },
-                # files= forces multipart/form-data as required by Stability API
-                files={
-                    "prompt":        (None, prompt),
-                    "output_format": (None, "jpeg"),
-                    "aspect_ratio":  (None, "1:1"),
-                },
+                json=payload,
             )
         if response.status_code == 200:
-            return response.content, None
+            # NovelAI returns a zip file containing the image
+            import zipfile
+            with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
+                image_filename = zf.namelist()[0]
+                image_bytes = zf.read(image_filename)
+            return image_bytes, None
         else:
             msg = response.text[:300]
-            logger.error(f"Stability API error {response.status_code}: {msg}")
-            return None, f"⚠️ Stability API error {response.status_code}: {msg}"
+            logger.error(f"NovelAI API error {response.status_code}: {msg}")
+            return None, f"⚠️ NovelAI API error {response.status_code}: {msg}"
     except Exception as e:
-        logger.error(f"Stability image generation failed [{label}]: {e}")
+        logger.error(f"NovelAI image generation failed [{label}]: {e}")
         return None, f"⚠️ {e}"
 
 
