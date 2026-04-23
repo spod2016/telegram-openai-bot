@@ -490,13 +490,19 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
                     chat_id=chat_id,
                     text=(
                         result_text
-                        + "\n\n⚠️ <b>Image generation failed.</b>\n"
+                        + "\n\n❌ <b>Image generation failed — the game cannot continue.</b>\n"
                         + (error_msg or "Unknown error.")
+                        + "\n\nPlease start a new game with /create."
                     ),
                     parse_mode="HTML",
                 )
         except Exception as e:
             logger.error(f"Failed to send result to {chat_id}: {e}")
+
+    # If image failed, terminate here — no comic mode without an origin image
+    if not image_data:
+        games.pop(token, None)
+        return
 
     # Offer comic mode to the HOST only
     host_id = player_ids[0]
@@ -689,38 +695,45 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
         fallback_prompt=fallback,
     )
 
-    # Content policy block — offer one retry, then force-skip
-    if image_data is None and image_error and "content policy" in image_error.lower():
+    # Any failure — offer one retry, then auto-skip
+    if image_data is None:
+        is_content_policy = image_error and "content policy" in image_error.lower()
         if not is_retry:
-            # First offence — give them one more chance
+            # First failure — give them one more chance
             comic["retry_player"] = chat_id
             pending_comic_input[chat_id] = token
-            await update.message.reply_text(
-                f"🚫 <b>Content policy violation.</b>\n\n"
-                f"That scene was flagged as unsafe. Please try a tamer description.\n\n"
-                f"⚠️ <i>If your next prompt is blocked again, your turn will be skipped automatically.</i>",
-                parse_mode="HTML",
-            )
+            if is_content_policy:
+                retry_msg = (
+                    f"🚫 <b>Content policy violation.</b>\n\n"
+                    f"That scene was flagged as unsafe. Please try a tamer description.\n\n"
+                    f"⚠️ <i>If your next prompt is blocked again, your turn will be skipped automatically.</i>"
+                )
+            else:
+                retry_msg = (
+                    f"⚠️ <b>Image generation failed.</b>\n"
+                    f"{image_error or 'Unknown error.'}\n\n"
+                    f"Please try again with a different description.\n"
+                    f"<i>If it fails again, your turn will be skipped automatically.</i>"
+                )
+            await update.message.reply_text(retry_msg, parse_mode="HTML")
             return
         else:
-            # Second offence — skip silently
+            # Second failure — auto-skip
             comic.pop("retry_player", None)
             author_name = comic["player_names"].get(chat_id, "A player")
+            skip_reason = "blocked by content policy twice" if is_content_policy else "image generation failed twice"
             for pid in comic["player_order"]:
                 try:
                     await context.bot.send_message(
                         chat_id=pid,
-                        text=(
-                            f"⏭️ <b>Panel {panel_num} skipped.</b> "
-                            f"{author_name}'s scene was blocked by content policy twice."
-                        ),
+                        text=f"⏭️ <b>Panel {panel_num} skipped.</b> {author_name}'s panel was {skip_reason}.",
                         parse_mode="HTML",
                     )
                 except Exception:
                     pass
             comic["panels"].append({
                 "author_id":  chat_id,
-                "prompt":     "[blocked by content policy]",
+                "prompt":     scene_text,
                 "image_data": None,
                 "skipped":    True,
             })
@@ -1230,7 +1243,7 @@ async def _generate_image(
 
     async def _try(p: str):
         response = await client.images.generate(
-            model="gpt-image-2",
+            model="gpt-image-1.5",
             prompt=p,
             n=1,
             size="1024x1024",
