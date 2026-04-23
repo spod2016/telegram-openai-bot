@@ -1367,10 +1367,11 @@ async def _generate_image_adult(prompt: str, label: str = "") -> tuple[bytes | N
                     "authorization": f"Bearer {STABILITY_API_KEY}",
                     "accept": "image/*",
                 },
-                data={
-                    "prompt": prompt,
-                    "output_format": "jpeg",
-                    "aspect_ratio": "1:1",
+                # files= forces multipart/form-data as required by Stability API
+                files={
+                    "prompt":        (None, prompt),
+                    "output_format": (None, "jpeg"),
+                    "aspect_ratio":  (None, "1:1"),
                 },
             )
         if response.status_code == 200:
