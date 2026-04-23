@@ -1360,28 +1360,20 @@ async def _generate_image_adult(prompt: str, label: str = "") -> tuple[bytes | N
     if not NOVELAI_API_KEY:
         return None, "⚠️ NovelAI API key not configured."
     try:
-        seed = random.randint(0, 2**32 - 1)
-        negative_prompt = (
-            "blurry, bad anatomy, bad hands, missing fingers, extra fingers, "
-            "deformed, ugly, lowres, text, watermark"
-        )
-        # NovelAI image generation endpoint — v4 requires v4_prompt/v4_negative_prompt
+        # NovelAI image generation endpoint
         payload = {
             "input": prompt,
-            "model": "nai-diffusion-4-5-full",
+            "model": "nai-diffusion-3",
             "action": "generate",
             "parameters": {
-                "params_version": 1,
                 "width": 1024,
                 "height": 1024,
-                "scale": 6.0,
+                "scale": 6.0,               # guidance scale
                 "sampler": "k_euler_ancestral",
                 "steps": 28,
-                "seed": seed,
-                "extra_noise_seed": seed,
                 "n_samples": 1,
-                "ucPreset": 3,
-                "qualityToggle": False,
+                "ucPreset": 0,
+                "qualityToggle": True,
                 "sm": False,
                 "sm_dyn": False,
                 "dynamic_thresholding": False,
@@ -1392,25 +1384,6 @@ async def _generate_image_adult(prompt: str, label: str = "") -> tuple[bytes | N
                 "cfg_rescale": 0.0,
                 "noise_schedule": "karras",
                 "legacy_v3_extend": False,
-                "negative_prompt": negative_prompt,
-                "prompt": prompt,
-                "reference_image_multiple": [],
-                "reference_information_extracted_multiple": [],
-                "reference_strength_multiple": [],
-                # v4 mandatory structured prompt fields
-                "v4_prompt": {
-                    "use_coords": False,
-                    "use_order": False,
-                    "caption": {"base_caption": prompt, "char_captions": []},
-                },
-                "v4_negative_prompt": {
-                    "use_coords": False,
-                    "use_order": False,
-                    "caption": {"base_caption": negative_prompt, "char_captions": []},
-                },
-                # k_euler_ancestral requires these for v4
-                "deliberate_euler_ancestral_bug": False,
-                "prefer_brownian": True,
             },
         }
         async with httpx.AsyncClient(timeout=120) as client:
