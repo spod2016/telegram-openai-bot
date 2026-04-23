@@ -1226,7 +1226,7 @@ async def _generate_image(
 ) -> tuple[bytes | None, str | None]:
     """Generate an image. Retry once with fallback_prompt on content-policy error."""
     logger.info(f"Generating image [{label}]: {prompt[:200]}")
-    client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=120.0, max_retries=1)
 
     async def _try(p: str):
         response = await client.images.generate(
