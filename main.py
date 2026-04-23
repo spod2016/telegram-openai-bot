@@ -103,11 +103,7 @@ def build_style_menu(include_adult: bool = True) -> str:
     lines = ["🎨 <b>Choose an art style for your image:</b>\n"]
     for i, (name, _) in enumerate(STYLES, 1):
         lines.append(f"{i}. {name}")
-    if include_adult:
-        lines.append(f"\n🔞 <b>11. Adult ╳╳╳</b>  <i>(18+ only, explicit content)</i>")
-        lines.append("\nReply with a number (1–11).")
-    else:
-        lines.append("\nReply with a number (1–10).")
+    lines.append("\nReply with a number (1–10).")
     return "\n".join(lines)
 
 
