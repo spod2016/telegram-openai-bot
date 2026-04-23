@@ -562,9 +562,10 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
         game["nai_tags"] = nai_tags
         game["nai_seed"] = random.randint(0, 2**32 - 1)
         logger.info(f"NAI tags for {token}: {nai_tags} | seed: {game['nai_seed']}")
-        quality_tags = "masterpiece, best quality, highly detailed, anime style"
+        quality_tags = "masterpiece, best quality, highly detailed, anime style, explicit"
         char_prefix  = f"{nai_tags}, " if nai_tags else ""
-        image_prompt = f"{quality_tags}, {char_prefix}{phrase}"
+        scene_tags   = await _scene_to_nai_tags(phrase, nai_tags)
+        image_prompt = f"{quality_tags}, {char_prefix}{scene_tags}"
     else:
         game["nai_tags"] = ""
         game["nai_seed"] = None
@@ -827,7 +828,7 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
     # Generate panel image — use NAI-optimised prompt and fixed seed for adult mode
     is_adult = comic.get("adult_mode", False)
     if is_adult:
-        prompt = _build_panel_prompt_adult(comic, scene_text)
+        prompt = await _build_panel_prompt_adult(comic, scene_text)
     else:
         prompt = _build_panel_prompt(comic, scene_text, panel_num)
     fallback = _build_panel_fallback_prompt(comic, scene_text)
@@ -1403,17 +1404,42 @@ async def _generate_character_bible_nai(original_phrase: str) -> str:
         return ""
 
 
-def _build_panel_prompt_adult(comic: dict, scene_text: str) -> str:
-    """Build a NovelAI V3 prompt using tag format for maximum character consistency."""
-    # Quality prefix — NAI V3 responds strongly to these
-    quality_tags = "masterpiece, best quality, highly detailed, anime style"
+async def _scene_to_nai_tags(scene_text: str, nai_tags: str) -> str:
+    """Use GPT-4o-mini to rewrite a player's natural language scene description
+    into Danbooru-style tags optimised for NovelAI V3."""
+    try:
+        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            max_tokens=120,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Convert this scene description into NovelAI/Danbooru-style image generation tags.\n"
+                    f"Scene: '{scene_text}'\n"
+                    f"Character already established: {nai_tags}\n\n"
+                    f"Output ONLY comma-separated lowercase Danbooru tags describing the scene: "
+                    f"action/pose, setting/background, lighting, mood, clothing state, "
+                    f"any relevant adult content details. "
+                    f"Do NOT repeat character appearance tags already listed above. "
+                    f"No sentences, no preamble, just tags. Max 20 tags."
+                )
+            }]
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.warning(f"Scene-to-tags conversion failed: {e}")
+        # Fall back to the raw scene text
+        return scene_text[:200]
 
-    # Character anchor in tag format
-    nai_tags = comic.get("nai_tags", "")
-    char_tags = f"{nai_tags}, " if nai_tags else ""
 
-    # Scene description — keep natural language but brief
-    scene_tags = scene_text[:200]
+async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> str:
+    """Build a NovelAI V3 prompt by rewriting the player's scene into Danbooru tags."""
+    quality_tags = "masterpiece, best quality, highly detailed, anime style, explicit"
+    nai_tags     = comic.get("nai_tags", "")
+    char_tags    = f"{nai_tags}, " if nai_tags else ""
+
+    scene_tags = await _scene_to_nai_tags(scene_text, nai_tags)
 
     return f"{quality_tags}, {char_tags}{scene_tags}"
 
