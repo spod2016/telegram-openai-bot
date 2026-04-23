@@ -1363,7 +1363,7 @@ async def _generate_image_adult(prompt: str, label: str = "") -> tuple[bytes | N
         # NovelAI image generation endpoint
         payload = {
             "input": prompt,
-            "model": "nai-diffusion-4-5",   # latest NovelAI anime model
+            "model": "nai-diffusion-4-5-full",   # latest NovelAI anime model
             "action": "generate",
             "parameters": {
                 "width": 1024,
