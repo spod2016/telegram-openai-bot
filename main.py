@@ -535,9 +535,9 @@ async def start_comic_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     n = len(game["player_order"])
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"1 round  ({n} panels)",   callback_data=f"comic_rounds:{token}:1"),
-        InlineKeyboardButton(f"2 rounds ({n*2} panels)", callback_data=f"comic_rounds:{token}:2"),
-        InlineKeyboardButton(f"3 rounds ({n*3} panels)", callback_data=f"comic_rounds:{token}:3"),
+        InlineKeyboardButton("1 round",  callback_data=f"comic_rounds:{token}:1"),
+        InlineKeyboardButton("2 rounds", callback_data=f"comic_rounds:{token}:2"),
+        InlineKeyboardButton("3 rounds", callback_data=f"comic_rounds:{token}:3"),
     ]])
     await query.edit_message_text(
         f"🎬 <b>Comic Book Mode</b>\n\n"
