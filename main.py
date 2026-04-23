@@ -26,6 +26,7 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -46,6 +47,8 @@ pending_comic_input: dict = {}  # chat_id -> token, for free-text comic turns
 WAITING_FOR_STYLE = 1
 WAITING_FOR_ANSWER = 2
 WAITING_FOR_SOLO_ANSWER = 3
+WAITING_FOR_AGE_CONFIRM = 4    # host age confirmation before adult game starts
+WAITING_FOR_PLAYER_AGE  = 5    # joining player age confirmation for adult games
 
 # ---------------------------------------------------------------------------
 # Game config
@@ -72,6 +75,14 @@ STYLES = [
     ("Renaissance",     "Renaissance painting style, classical composition, chiaroscuro lighting, museum quality"),
 ]
 
+# Adult style — separate entry, uses Stability AI
+ADULT_STYLE = ("🔞 Adult", "explicit adult content, highly detailed, sensual illustration")
+
+ADULT_STYLE_PROMPT_SUFFIX = (
+    "explicit adult content, highly detailed, mature themes, sensual, erotic illustration. "
+    "No censorship."
+)
+
 GAME_TIMEOUT_MINUTES = 30
 STRIP_LINE_H = 18          # pixel height per text line in comic strip captions
 
@@ -88,11 +99,15 @@ def is_game_expired(game: dict) -> bool:
     return datetime.utcnow() - game["created_at"] > timedelta(minutes=GAME_TIMEOUT_MINUTES)
 
 
-def build_style_menu() -> str:
+def build_style_menu(include_adult: bool = True) -> str:
     lines = ["🎨 <b>Choose an art style for your image:</b>\n"]
     for i, (name, _) in enumerate(STYLES, 1):
         lines.append(f"{i}. {name}")
-    lines.append("\nReply with a number (1–10).")
+    if include_adult:
+        lines.append(f"\n🔞 <b>11. Adult ╳╳╳</b>  <i>(18+ only, explicit content)</i>")
+        lines.append("\nReply with a number (1–11).")
+    else:
+        lines.append("\nReply with a number (1–10).")
     return "\n".join(lines)
 
 
@@ -125,22 +140,72 @@ async def create_game_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     context.user_data["pending_num_players"] = n
-    await update.message.reply_text(build_style_menu(), parse_mode="HTML")
+    await update.message.reply_text(build_style_menu(include_adult=True), parse_mode="HTML")
     return WAITING_FOR_STYLE
 
 
 async def receive_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
-    if not text.isdigit() or not (1 <= int(text) <= 10):
-        await update.message.reply_text("❌ Please reply with a number between 1 and 10.")
+    if not text.isdigit() or not (1 <= int(text) <= 11):
+        await update.message.reply_text("❌ Please reply with a number between 1 and 11.")
         return WAITING_FOR_STYLE
 
-    style_index = int(text) - 1
-    style_name, style_prompt = STYLES[style_index]
-    n = context.user_data["pending_num_players"]
+    choice = int(text)
 
-    # Solo mode — auto-join and start asking questions immediately
+    # Adult mode selected — ask host for age confirmation first
+    if choice == 11:
+        if not STABILITY_API_KEY:
+            await update.message.reply_text(
+                "⚠️ Adult mode is not configured on this server. "
+                "Please choose a style from 1–10."
+            )
+            return WAITING_FOR_STYLE
+        context.user_data["pending_style_choice"] = 11
+        await update.message.reply_text(
+            "🔞 <b>Adult mode selected.</b>\n\n"
+            "This mode generates explicit content using an external AI model.\n\n"
+            "⚠️ You must be 18 or older to proceed.\n\n"
+            "Are you 18+? Reply <b>YES</b> to confirm or <b>NO</b> to go back and choose a different style.",
+            parse_mode="HTML",
+        )
+        return WAITING_FOR_AGE_CONFIRM
+
+    # Standard style
+    context.user_data["pending_style_choice"] = choice
+    return await _finalise_style(update, context)
+
+
+async def receive_age_confirm_host(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle host age confirmation for adult mode."""
+    answer = update.message.text.strip().upper()
+
+    if answer in ("YES", "Y", "ДА", "ДА"):
+        # Confirmed — proceed with adult style
+        return await _finalise_style(update, context)
+    else:
+        # Declined — show safe style menu without option 11
+        context.user_data.pop("pending_style_choice", None)
+        await update.message.reply_text(
+            "No problem! Please choose a style from the list below.",
+        )
+        await update.message.reply_text(build_style_menu(include_adult=False), parse_mode="HTML")
+        return WAITING_FOR_STYLE
+
+
+async def _finalise_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Create the game after style and (if needed) age confirmation."""
+    choice   = context.user_data.get("pending_style_choice", 1)
+    n        = context.user_data["pending_num_players"]
+    is_adult = (choice == 11)
+
+    if is_adult:
+        style_name   = ADULT_STYLE[0]
+        style_prompt = ADULT_STYLE_PROMPT_SUFFIX
+    else:
+        style_name, style_prompt = STYLES[choice - 1]
+
+    # Solo mode
     if n == 1:
         chat_id = update.effective_chat.id
         token = generate_token()
@@ -159,7 +224,8 @@ async def receive_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "style_prompt": style_prompt,
             "style_name": style_name,
             "original_phrase": None,
-            "solo_answers": [],   # ordered list of all 5 answers
+            "solo_answers": [],
+            "adult_mode": is_adult,
         }
 
         _join_game(games[token], token, chat_id, update.effective_user, context)
@@ -173,7 +239,7 @@ async def receive_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_FOR_SOLO_ANSWER
 
-    # Multiplayer — show invite links as before
+    # Multiplayer
     token = generate_token()
     while token in games:
         token = generate_token()
@@ -190,10 +256,11 @@ async def receive_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "style_prompt": style_prompt,
         "style_name": style_name,
         "original_phrase": None,
+        "adult_mode": is_adult,
     }
 
     bot_username = context.bot.username
-    deep_link = f"https://t.me/{bot_username}?start={token}"
+    deep_link    = f"https://t.me/{bot_username}?start={token}"
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(
@@ -206,11 +273,14 @@ async def receive_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )],
     ])
 
+    adult_note = "\n🔞 <b>This is an adult game. All players must confirm they are 18+ before joining.</b>" if is_adult else ""
+
     await update.message.reply_text(
         f"✅ Game created!\n\n"
         f"🔑 Token: <code>{token}</code>\n"
         f"👥 Players needed: {n}\n"
-        f"🎨 Style: <b>{style_name}</b>\n\n"
+        f"🎨 Style: <b>{style_name}</b>"
+        f"{adult_note}\n\n"
         f"Tap <b>Share game invite</b> to send the join link to other players.\n\n"
         f"⏳ This game expires in {GAME_TIMEOUT_MINUTES} minutes.",
         parse_mode="HTML",
@@ -270,6 +340,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🚫 Game is full. No more players can join.")
         return
 
+    # Adult game — ask player to confirm age before joining
+    if game.get("adult_mode"):
+        context.user_data["pending_adult_token"] = token
+        await update.message.reply_text(
+            f"🔞 <b>This is an adult game.</b>\n\n"
+            f"Explicit content will be generated. You must be 18 or older to participate.\n\n"
+            f"Are you 18+? Reply <b>YES</b> to join or <b>NO</b> to decline.",
+            parse_mode="HTML",
+        )
+        return WAITING_FOR_PLAYER_AGE
+
     role_index = _join_game(game, token, chat_id, update.effective_user, context)
 
     await update.message.reply_text(
@@ -279,6 +360,43 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
     )
     return WAITING_FOR_ANSWER
+
+
+async def receive_player_age_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Age confirmation for players joining an adult game."""
+    answer  = update.message.text.strip().upper()
+    token   = context.user_data.get("pending_adult_token")
+    chat_id = update.effective_chat.id
+
+    if not token or token not in games:
+        await update.message.reply_text("❌ Game not found. Ask the host to create a new one.")
+        return ConversationHandler.END
+
+    if answer in ("YES", "Y", "ДА"):
+        game = games[token]
+
+        if len(game["player_order"]) >= game["num_players"]:
+            await update.message.reply_text("🚫 Sorry, the game filled up while you were confirming.")
+            context.user_data.pop("pending_adult_token", None)
+            return ConversationHandler.END
+
+        role_index = _join_game(game, token, chat_id, update.effective_user, context)
+        context.user_data.pop("pending_adult_token", None)
+        await update.message.reply_text(
+            f"✅ Age confirmed. Welcome!\n\n"
+            f"🎮 You joined game <code>{token}</code>!\n\n"
+            f"Your role: <b>{ROLES[role_index]}</b>\n\n"
+            f"{ROLE_QUESTIONS[role_index]}",
+            parse_mode="HTML",
+        )
+        return WAITING_FOR_ANSWER
+    else:
+        context.user_data.pop("pending_adult_token", None)
+        await update.message.reply_text(
+            "🚫 Sorry, you must be 18+ to join this game. "
+            "Ask the host to create a regular game for you."
+        )
+        return ConversationHandler.END
 
 
 async def play_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -451,6 +569,7 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
         image_prompt,
         label=f"game {token} [{style_name}]",
         fallback_prompt=fallback_prompt,
+        adult_mode=game.get("adult_mode", False),
     )
 
     # Keep the initial image so it can be included as panel 0 in the comic book
@@ -586,6 +705,7 @@ async def set_comic_rounds_callback(update: Update, context: ContextTypes.DEFAUL
         "rounds":             rounds,
         "created_at":         datetime.utcnow(),
         "compiling":          False,
+        "adult_mode":         game.get("adult_mode", False),
     }
 
     await query.edit_message_text(
@@ -693,6 +813,7 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
         prompt,
         label=f"panel {panel_num} of game {token}",
         fallback_prompt=fallback,
+        adult_mode=comic.get("adult_mode", False),
     )
 
     # Any failure — offer one retry, then auto-skip
@@ -1229,6 +1350,41 @@ def _load_fonts():
 
 
 # ---------------------------------------------------------------------------
+# Adult image generation via Stability AI
+# ---------------------------------------------------------------------------
+
+async def _generate_image_adult(prompt: str, label: str = "") -> tuple[bytes | None, str | None]:
+    """Generate adult content image via Stability AI Core model."""
+    import httpx
+    logger.info(f"Generating adult image [{label}]: {prompt[:200]}")
+    if not STABILITY_API_KEY:
+        return None, "⚠️ Stability AI key not configured."
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            response = await client.post(
+                "https://api.stability.ai/v2beta/stable-image/generate/core",
+                headers={
+                    "authorization": f"Bearer {STABILITY_API_KEY}",
+                    "accept": "image/*",
+                },
+                data={
+                    "prompt": prompt,
+                    "output_format": "jpeg",
+                    "aspect_ratio": "1:1",
+                },
+            )
+        if response.status_code == 200:
+            return response.content, None
+        else:
+            msg = response.text[:300]
+            logger.error(f"Stability API error {response.status_code}: {msg}")
+            return None, f"⚠️ Stability API error {response.status_code}: {msg}"
+    except Exception as e:
+        logger.error(f"Stability image generation failed [{label}]: {e}")
+        return None, f"⚠️ {e}"
+
+
+# ---------------------------------------------------------------------------
 # Shared image generation helper
 # ---------------------------------------------------------------------------
 
@@ -1236,8 +1392,12 @@ async def _generate_image(
     prompt: str,
     label: str = "",
     fallback_prompt: str | None = None,
+    adult_mode: bool = False,
 ) -> tuple[bytes | None, str | None]:
-    """Generate an image. Retry once with fallback_prompt on content-policy error."""
+    """Generate an image. Routes to Stability AI for adult mode, OpenAI otherwise."""
+    if adult_mode:
+        return await _generate_image_adult(prompt, label=label)
+
     logger.info(f"Generating image [{label}]: {prompt[:200]}")
     client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=120.0, max_retries=1)
 
@@ -1406,6 +1566,9 @@ def main():
             WAITING_FOR_STYLE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, receive_style)
             ],
+            WAITING_FOR_AGE_CONFIRM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, receive_age_confirm_host)
+            ],
             WAITING_FOR_SOLO_ANSWER: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, receive_solo_answer)
             ],
@@ -1424,6 +1587,9 @@ def main():
         states={
             WAITING_FOR_ANSWER: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, receive_answer)
+            ],
+            WAITING_FOR_PLAYER_AGE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, receive_player_age_confirm)
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
