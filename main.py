@@ -558,8 +558,23 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
     if character_bible:
         logger.info(f"Character bible for {token}: {character_bible}")
 
-    bible_prefix = f"{character_bible}. " if character_bible else ""
-    image_prompt = f"{bible_prefix}{phrase}.{mood_part}{twist_part} {style_prompt}."
+    # For adult mode: also generate NAI tag-format bible and fix a seed
+    # so NovelAI V3 renders the same character across all panels.
+    is_adult = game.get("adult_mode", False)
+    if is_adult:
+        nai_tags = await _generate_character_bible_nai(phrase)
+        game["nai_tags"] = nai_tags
+        game["nai_seed"] = random.randint(0, 2**32 - 1)
+        logger.info(f"NAI tags for {token}: {nai_tags} | seed: {game['nai_seed']}")
+        quality_tags = "masterpiece, best quality, highly detailed, anime style"
+        char_prefix  = f"{nai_tags}, " if nai_tags else ""
+        image_prompt = f"{quality_tags}, {char_prefix}{phrase}"
+    else:
+        game["nai_tags"] = ""
+        game["nai_seed"] = None
+        bible_prefix = f"{character_bible}. " if character_bible else ""
+        image_prompt = f"{bible_prefix}{phrase}.{mood_part}{twist_part} {style_prompt}."
+
     fallback_prompt = (
         f"A single illustration of: {phrase}. "
         f"Visual style: {style_prompt}. "
@@ -569,7 +584,8 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
         image_prompt,
         label=f"game {token} [{style_name}]",
         fallback_prompt=fallback_prompt,
-        adult_mode=game.get("adult_mode", False),
+        adult_mode=is_adult,
+        nai_seed=game.get("nai_seed"),
     )
 
     # Keep the initial image so it can be included as panel 0 in the comic book
@@ -723,6 +739,12 @@ async def set_comic_rounds_callback(update: Update, context: ContextTypes.DEFAUL
     if character_bible:
         logger.info(f"Reusing character bible for comic {token}: {character_bible}")
 
+    # For adult mode: store nai_tags (tag-format bible) and a fixed seed
+    # so all panels share the same character appearance in NovelAI V3
+    comic_sessions[token]["nai_tags"]  = game.get("nai_tags", "")
+    comic_sessions[token]["nai_seed"]  = game.get("nai_seed",
+                                            random.randint(0, 2**32 - 1))
+
     # Carry the initial image forward so compile_comic can include it
     comic_sessions[token]["initial_image_data"] = game.get("initial_image_data")
 
@@ -806,14 +828,19 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await update.message.reply_text(f"✅ Got it! Generating panel {panel_num}… 🎨 (this takes ~15 seconds)")
 
-    # Generate panel image
-    prompt   = _build_panel_prompt(comic, scene_text, panel_num)
+    # Generate panel image — use NAI-optimised prompt and fixed seed for adult mode
+    is_adult = comic.get("adult_mode", False)
+    if is_adult:
+        prompt = _build_panel_prompt_adult(comic, scene_text)
+    else:
+        prompt = _build_panel_prompt(comic, scene_text, panel_num)
     fallback = _build_panel_fallback_prompt(comic, scene_text)
     image_data, image_error = await _generate_image(
         prompt,
         label=f"panel {panel_num} of game {token}",
         fallback_prompt=fallback,
-        adult_mode=comic.get("adult_mode", False),
+        adult_mode=is_adult,
+        nai_seed=comic.get("nai_seed"),
     )
 
     # Any failure — offer one retry, then auto-skip
@@ -1353,14 +1380,71 @@ def _load_fonts():
 # Adult image generation via Stability AI
 # ---------------------------------------------------------------------------
 
-async def _generate_image_adult(prompt: str, label: str = "") -> tuple[bytes | None, str | None]:
-    """Generate adult anime image via NovelAI image generation API."""
+async def _generate_character_bible_nai(original_phrase: str) -> str:
+    """Generate a NovelAI V3-compatible tag-format character description.
+    Uses Danbooru-style comma-separated tags so NAI renders consistently."""
+    try:
+        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            max_tokens=80,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Convert this character description into NovelAI/Danbooru-style image tags. "
+                    f"Story premise: '{original_phrase}'. "
+                    f"Output ONLY comma-separated tags describing: "
+                    f"gender (1girl/1boy), approximate age, hair color + hair length/style, "
+                    f"eye color, clothing items, one or two body traits. "
+                    f"Use lowercase Danbooru tag format. No sentences. No preamble. "
+                    f"Example: 1girl, long red hair, blue eyes, white dress, slim figure"
+                )
+            }]
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.warning(f"NAI character tag generation failed: {e}")
+        return ""
+
+
+def _build_panel_prompt_adult(comic: dict, scene_text: str) -> str:
+    """Build a NovelAI V3 prompt using tag format for maximum character consistency."""
+    # Quality prefix — NAI V3 responds strongly to these
+    quality_tags = "masterpiece, best quality, highly detailed, anime style"
+
+    # Character anchor in tag format
+    nai_tags = comic.get("nai_tags", "")
+    char_tags = f"{nai_tags}, " if nai_tags else ""
+
+    # Scene description — keep natural language but brief
+    scene_tags = scene_text[:200]
+
+    return f"{quality_tags}, {char_tags}{scene_tags}"
+
+
+def _build_negative_prompt_adult() -> str:
+    """Standard negative prompt for NovelAI V3 adult generation."""
+    return (
+        "lowres, bad anatomy, bad hands, text, error, missing fingers, "
+        "extra digit, fewer digits, cropped, worst quality, low quality, "
+        "normal quality, jpeg artifacts, signature, watermark, username, "
+        "blurry, multiple characters, extra people"
+    )
+
+
+async def _generate_image_adult(
+    prompt: str,
+    label: str = "",
+    seed: int | None = None,
+) -> tuple[bytes | None, str | None]:
+    """Generate adult anime image via NovelAI V3.
+    Pass a fixed seed to keep character appearance consistent across panels."""
     import httpx
     logger.info(f"Generating adult image via NovelAI [{label}]: {prompt[:200]}")
     if not NOVELAI_API_KEY:
         return None, "⚠️ NovelAI API key not configured."
     try:
-        # NovelAI image generation endpoint
+        actual_seed = seed if seed is not None else random.randint(0, 2**32 - 1)
         payload = {
             "input": prompt,
             "model": "nai-diffusion-3",
@@ -1368,22 +1452,19 @@ async def _generate_image_adult(prompt: str, label: str = "") -> tuple[bytes | N
             "parameters": {
                 "width": 1024,
                 "height": 1024,
-                "scale": 6.0,               # guidance scale
+                "scale": 6.0,
                 "sampler": "k_euler_ancestral",
                 "steps": 28,
                 "n_samples": 1,
+                "seed": actual_seed,
+                "negative_prompt": _build_negative_prompt_adult(),
                 "ucPreset": 0,
                 "qualityToggle": True,
                 "sm": False,
                 "sm_dyn": False,
                 "dynamic_thresholding": False,
-                "controlnet_strength": 1.0,
                 "legacy": False,
-                "add_original_image": False,
-                "uncond_scale": 1.0,
-                "cfg_rescale": 0.0,
                 "noise_schedule": "karras",
-                "legacy_v3_extend": False,
             },
         }
         async with httpx.AsyncClient(timeout=120) as client:
@@ -1397,11 +1478,9 @@ async def _generate_image_adult(prompt: str, label: str = "") -> tuple[bytes | N
                 json=payload,
             )
         if response.status_code == 200:
-            # NovelAI returns a zip file containing the image
             import zipfile
             with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
-                image_filename = zf.namelist()[0]
-                image_bytes = zf.read(image_filename)
+                image_bytes = zf.read(zf.namelist()[0])
             return image_bytes, None
         else:
             msg = response.text[:300]
@@ -1421,10 +1500,11 @@ async def _generate_image(
     label: str = "",
     fallback_prompt: str | None = None,
     adult_mode: bool = False,
+    nai_seed: int | None = None,
 ) -> tuple[bytes | None, str | None]:
-    """Generate an image. Routes to Stability AI for adult mode, OpenAI otherwise."""
+    """Generate an image. Routes to NovelAI for adult mode, OpenAI otherwise."""
     if adult_mode:
-        return await _generate_image_adult(prompt, label=label)
+        return await _generate_image_adult(prompt, label=label, seed=nai_seed)
 
     logger.info(f"Generating image [{label}]: {prompt[:200]}")
     client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=120.0, max_retries=1)
