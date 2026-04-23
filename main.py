@@ -73,6 +73,7 @@ STYLES = [
 ]
 
 GAME_TIMEOUT_MINUTES = 30
+STRIP_LINE_H = 18          # pixel height per text line in comic strip captions
 
 
 # ---------------------------------------------------------------------------
@@ -1014,9 +1015,7 @@ def _build_comic_strip(
         # ── Design constants ────────────────────────────────────────────────
         COLS        = num_players          # columns = players (each row = 1 round)
         PANEL_SIZE  = _panel_size(COLS)    # adaptive square panel size
-        CAPTION_H   = 100                  # caption area height below each panel
         PAD         = 14                   # gap between cells and canvas edges
-        ORIGIN_H    = PANEL_SIZE + CAPTION_H  # origin cell height
 
         # Colours
         BG          = (18, 18, 26)
@@ -1031,15 +1030,38 @@ def _build_comic_strip(
         # ── Fonts ───────────────────────────────────────────────────────────
         font_bold, font_reg, font_small = _load_fonts()
 
-        # ── Canvas dimensions ───────────────────────────────────────────────
+        # ── Canvas width (needed before caption height calculation) ──────────
         canvas_w = COLS * PANEL_SIZE + (COLS + 1) * PAD
+        ow       = canvas_w - 2 * PAD     # origin image width
 
-        # Count real (non-skipped) panels
+        # ── Dynamic caption height — fit the longest prompt ──────────────────
+        # Count lines needed for each prompt given the available width.
+        def _lines_needed(text: str, available_w: int) -> int:
+            chars = max(10, available_w // 8)
+            return len(textwrap.wrap(text, width=chars)) or 1
+
+        max_panel_lines  = max(
+            (_lines_needed(p["prompt"], PANEL_SIZE - 34)
+             for p in panels if not p.get("skipped") and p.get("image_data")),
+            default=1,
+        )
+        origin_lines     = _lines_needed(original_phrase, ow - 38)
+
+        # Caption = number label row (20px) + text lines + bottom padding (8px)
+        CAPTION_H        = max(40, 20 + max_panel_lines * STRIP_LINE_H + 8)
+        ORIGIN_CAPTION_H = max(40, 20 + origin_lines   * STRIP_LINE_H + 8)
+
+        # ── Origin image height: 2:1 ratio, capped at 700px ─────────────────
+        # Caption sits BELOW the image (not overlaid), so nothing is hidden.
+        ORIGIN_IMG_H = min(ow // 2, 700)
+        ORIGIN_H     = ORIGIN_IMG_H + ORIGIN_CAPTION_H  # image + caption strip
+
+        # ── Canvas dimensions ───────────────────────────────────────────────
         real_comic_panels = [p for p in panels if not p.get("skipped") and p.get("image_data")]
         n_comic = len(real_comic_panels)
         rows    = max(1, -(-n_comic // COLS))  # ceiling division
 
-        origin_block_h = ORIGIN_H + 2 * PAD  # origin + top/bottom padding
+        origin_block_h = ORIGIN_H + 2 * PAD
         grid_h         = rows * (PANEL_SIZE + CAPTION_H + PAD) + PAD
         canvas_h       = origin_block_h + grid_h
 
@@ -1049,28 +1071,25 @@ def _build_comic_strip(
         # ── Draw origin image ────────────────────────────────────────────────
         ox = PAD
         oy = PAD
-        ow = canvas_w - 2 * PAD
-        oh = ORIGIN_H
 
         if initial_image_data:
             orig_img = Image.open(io.BytesIO(initial_image_data)).convert("RGB")
-            # Fill width, crop height from center so it doesn't letterbox
-            orig_img = _resize_cover(orig_img, ow, oh)
+            orig_img = _resize_cover(orig_img, ow, ORIGIN_IMG_H)
         else:
-            orig_img = Image.new("RGB", (ow, oh), ORIGIN_BG)
+            orig_img = Image.new("RGB", (ow, ORIGIN_IMG_H), ORIGIN_BG)
 
         canvas.paste(orig_img, (ox, oy))
 
-        # Origin caption overlay at the bottom of the image
-        cap_y = oy + oh - CAPTION_H
-        draw.rectangle([ox, cap_y, ox + ow, oy + oh], fill=(0, 0, 0, 0))
-        # Semi-transparent dark bar (Pillow RGB — simulate with a dark fill)
-        draw.rectangle([ox, cap_y, ox + ow, oy + oh], fill=(15, 12, 24))
-        draw.text((ox + 10, cap_y + 6),  "1.",  font=font_bold,  fill=C_LABEL)
-        _draw_wrapped(draw, original_phrase, ox + 28, cap_y + 6, ow - 38, 3, font_small, C_TEXT)
+        # Border around image only
+        draw.rectangle([ox - 2, oy - 2, ox + ow + 1, oy + ORIGIN_IMG_H + 1],
+                       outline=BORDER, width=3)
 
-        # Border
-        draw.rectangle([ox - 2, oy - 2, ox + ow + 1, oy + oh + 1], outline=BORDER, width=3)
+        # Caption strip BELOW the origin image (not overlaid)
+        cap_y = oy + ORIGIN_IMG_H
+        draw.rectangle([ox, cap_y, ox + ow, cap_y + ORIGIN_CAPTION_H], fill=CAPTION_BG)
+        draw.text((ox + 10, cap_y + 6), "1.", font=font_bold, fill=C_LABEL)
+        _draw_wrapped(draw, original_phrase,
+                      ox + 28, cap_y + 6, ow - 38, origin_lines, font_small, C_TEXT)
 
         # ── Draw comic panels in grid ────────────────────────────────────────
         grid_top = origin_block_h
@@ -1093,17 +1112,16 @@ def _build_comic_strip(
                 outline=BORDER, width=2,
             )
 
-            # Caption area
+            # Caption area below image
             cy = py + PANEL_SIZE
             draw.rectangle([px, cy, px + PANEL_SIZE, cy + CAPTION_H], fill=CAPTION_BG)
 
-            # Find original panel index (for numbering — skipped panels shift things)
-            orig_num = panels.index(panel) + 1
-            author   = player_names.get(panel["author_id"], "Player")
-
-            display_num = orig_num + 1  # origin is 1, so panels start at 2
-            draw.text((px + 8, cy + 5),  f"{display_num}.",  font=font_bold,  fill=C_LABEL)
-            _draw_wrapped(draw, panel["prompt"], px + 26, cy + 5, PANEL_SIZE - 34, 3, font_small, C_TEXT)
+            orig_num    = panels.index(panel) + 1
+            display_num = orig_num + 1  # origin is 1, panels start at 2
+            prompt_lines = _lines_needed(panel["prompt"], PANEL_SIZE - 34)
+            draw.text((px + 8, cy + 5), f"{display_num}.", font=font_bold, fill=C_LABEL)
+            _draw_wrapped(draw, panel["prompt"],
+                          px + 26, cy + 5, PANEL_SIZE - 34, prompt_lines, font_small, C_TEXT)
 
         # ── Serialise ────────────────────────────────────────────────────────
         buf = io.BytesIO()
@@ -1154,15 +1172,13 @@ def _draw_wrapped(
     font,
     color: tuple,
 ) -> None:
-    """Draw word-wrapped text, truncating with … if it exceeds max_lines."""
-    # Estimate characters per line from max_w and avg char width (~8px for small font)
+    """Draw word-wrapped text across as many lines as needed."""
     chars_per_line = max(10, max_w // 8)
     lines = textwrap.wrap(text, width=chars_per_line)
-    if len(lines) > max_lines:
-        lines = lines[:max_lines]
-        lines[-1] = lines[-1][:chars_per_line - 1] + "…"
+    if not lines:
+        return
     for i, line in enumerate(lines):
-        draw.text((x, y + i * 18), line, font=font, fill=color)
+        draw.text((x, y + i * STRIP_LINE_H), line, font=font, fill=color)
 
 
 def _load_fonts():
