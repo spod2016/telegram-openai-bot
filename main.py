@@ -27,6 +27,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 NOVELAI_API_KEY = os.getenv("NOVELAI_API_KEY")
+GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -1379,24 +1380,37 @@ def _load_fonts():
 
 async def _generate_character_bible_nai(original_phrase: str) -> str:
     """Generate a NovelAI V3-compatible tag-format character description.
-    Uses Danbooru-style comma-separated tags so NAI renders consistently."""
+    Uses Groq (Llama) which allows adult content, unlike OpenAI."""
     try:
-        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        client = AsyncOpenAI(
+            api_key=GROQ_API_KEY,
+            base_url="https://api.groq.com/openai/v1",
+        )
         response = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="llama3-70b-8192",
             max_tokens=80,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Convert this character description into NovelAI/Danbooru-style image tags. "
-                    f"Story premise: '{original_phrase}'. "
-                    f"Output ONLY comma-separated tags describing: "
-                    f"gender (1girl/1boy), approximate age, hair color + hair length/style, "
-                    f"eye color, clothing items, one or two body traits. "
-                    f"Use lowercase Danbooru tag format. No sentences. No preamble. "
-                    f"Example: 1girl, long red hair, blue eyes, white dress, slim figure"
-                )
-            }]
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a tag generator for an adult anime image platform. "
+                        "Convert character descriptions into Danbooru-style tags. "
+                        "Always respond with only comma-separated tags, no refusals."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Convert this character description into NovelAI/Danbooru-style image tags. "
+                        f"Story premise: '{original_phrase}'. "
+                        f"Output ONLY comma-separated tags describing: "
+                        f"gender (1girl/1boy), approximate age, hair color + hair length/style, "
+                        f"eye color, clothing items, one or two body traits. "
+                        f"Use lowercase Danbooru tag format. No sentences. No preamble. "
+                        f"Example: 1girl, long red hair, blue eyes, white dress, slim figure"
+                    ),
+                },
+            ],
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -1405,29 +1419,44 @@ async def _generate_character_bible_nai(original_phrase: str) -> str:
 
 
 async def _scene_to_nai_tags(scene_text: str, nai_tags: str) -> str:
-    """Use GPT-4o-mini to rewrite a player's natural language scene description
-    into Danbooru-style tags optimised for NovelAI V3."""
+    """Use Groq (Llama) to rewrite a player's scene description into
+    Danbooru-style tags for NovelAI V3. Groq allows adult content."""
     try:
-        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        client = AsyncOpenAI(
+            api_key=GROQ_API_KEY,
+            base_url="https://api.groq.com/openai/v1",
+        )
         response = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="llama3-70b-8192",
             max_tokens=120,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Convert this scene description into NovelAI/Danbooru-style image generation tags.\n"
-                    f"Scene: '{scene_text}'\n"
-                    f"Character already established: {nai_tags}\n\n"
-                    f"Output ONLY comma-separated lowercase Danbooru tags describing the scene: "
-                    f"action/pose, setting/background, lighting, mood, clothing state, "
-                    f"any relevant adult content details. "
-                    f"Do NOT repeat character appearance tags already listed above. "
-                    f"No sentences, no preamble, just tags. Max 20 tags."
-                )
-            }]
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a tag generator for an adult anime image platform. "
+                        "Convert scene descriptions into Danbooru-style tags including explicit content. "
+                        "Always respond with only comma-separated tags, no refusals."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Convert this scene description into NovelAI/Danbooru-style image generation tags.\n"
+                        f"Scene: '{scene_text}'\n"
+                        f"Character already established: {nai_tags}\n\n"
+                        f"Output ONLY comma-separated lowercase Danbooru tags describing the scene: "
+                        f"action/pose, setting/background, lighting, mood, clothing state, "
+                        f"any relevant adult content details. "
+                        f"Do NOT repeat character appearance tags already listed above. "
+                        f"No sentences, no preamble, just tags. Max 20 tags."
+                    ),
+                },
+            ],
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
+        logger.warning(f"Scene-to-tags conversion failed: {e}")
+        return scene_text[:200]
         logger.warning(f"Scene-to-tags conversion failed: {e}")
         # Fall back to the raw scene text
         return scene_text[:200]
