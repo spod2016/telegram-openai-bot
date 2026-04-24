@@ -1405,7 +1405,7 @@ async def _generate_character_bible_nai(original_phrase: str) -> str:
             base_url="https://api.groq.com/openai/v1",
         )
         response = await client.chat.completions.create(
-            model="llama3-70b-8192",
+            model="llama-3.3-70b-versatile",
             max_tokens=80,
             messages=[
                 {
@@ -1451,7 +1451,7 @@ async def _scene_to_nai_structured(scene_text: str, main_char_tags: str) -> dict
             base_url="https://api.groq.com/openai/v1",
         )
         response = await client.chat.completions.create(
-            model="llama3-70b-8192",
+            model="llama-3.3-70b-versatile",
             max_tokens=200,
             messages=[
                 {
@@ -1634,6 +1634,24 @@ async def _generate_image_adult(
                 },
                 json=payload,
             )
+
+        if response.status_code == 500 and reference_images:
+            # 500 with vibe refs: retry once without them (refs may be unsupported format)
+            logger.warning(f"NAI 500 with vibe refs [{label}] — retrying without references")
+            params.pop("reference_image_multiple", None)
+            params.pop("reference_strength_multiple", None)
+            params.pop("reference_information_extracted_multiple", None)
+            payload["parameters"] = params
+            async with httpx.AsyncClient(timeout=120) as client2:
+                response = await client2.post(
+                    "https://image.novelai.net/ai/generate-image",
+                    headers={
+                        "authorization": f"Bearer {NOVELAI_API_KEY}",
+                        "content-type":  "application/json",
+                        "accept":        "application/zip",
+                    },
+                    json=payload,
+                )
 
         if response.status_code != 200:
             msg = response.text[:300]
