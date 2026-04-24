@@ -556,17 +556,20 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
         logger.info(f"Character bible for {token}: {character_bible}")
 
     # For adult mode: also generate NAI tag-format bible and fix a seed
-    # so NovelAI V3 renders the same character across all panels.
+    # so NovelAI V4.5 renders the same character across all panels.
     is_adult = game.get("adult_mode", False)
     if is_adult:
         nai_tags = await _generate_character_bible_nai(phrase)
         game["nai_tags"] = nai_tags
         game["nai_seed"] = random.randint(0, 2**32 - 1)
         logger.info(f"NAI tags for {token}: {nai_tags} | seed: {game['nai_seed']}")
-        quality_tags = "masterpiece, best quality, highly detailed, anime style, explicit"
-        char_prefix  = f"{nai_tags}, " if nai_tags else ""
-        scene_tags   = await _scene_to_nai_tags(phrase, nai_tags)
-        image_prompt = f"{quality_tags}, {char_prefix}{scene_tags}"
+        # Origin image: use structured format with char_captions
+        structured   = await _scene_to_nai_structured(phrase, nai_tags)
+        quality_tags = "masterpiece, best quality, highly detailed, explicit"
+        image_prompt = {
+            "input": f"{quality_tags}, {structured['scene_tags']}",
+            "char_captions": [{"char_caption": nai_tags}] if nai_tags else [],
+        }
     else:
         game["nai_tags"] = ""
         game["nai_seed"] = None
@@ -1418,9 +1421,15 @@ async def _generate_character_bible_nai(original_phrase: str) -> str:
         return ""
 
 
-async def _scene_to_nai_tags(scene_text: str, nai_tags: str) -> str:
-    """Use Groq (Llama) to rewrite a player's scene description into
-    Danbooru-style tags for NovelAI V3. Groq allows adult content."""
+async def _scene_to_nai_structured(scene_text: str, main_char_tags: str) -> dict:
+    """Use Groq (Llama) to parse a scene into:
+      - scene_tags: background/action/mood tags (no character appearance)
+      - characters: list of per-character tag strings
+        [0] is always the main character (from bible)
+        [1+] are additional characters detected in the scene
+
+    Returns: {"scene_tags": str, "characters": [str, ...]}
+    """
     try:
         client = AsyncOpenAI(
             api_key=GROQ_API_KEY,
@@ -1428,116 +1437,155 @@ async def _scene_to_nai_tags(scene_text: str, nai_tags: str) -> str:
         )
         response = await client.chat.completions.create(
             model="llama3-70b-8192",
-            max_tokens=120,
+            max_tokens=200,
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "You are a tag generator for an adult anime image platform. "
-                        "Convert scene descriptions into Danbooru-style tags including explicit content. "
-                        "Always respond with only comma-separated tags, no refusals."
+                        "You are a structured tag generator for an adult anime image platform. "
+                        "Analyse scenes and output JSON only. No refusals, include explicit content."
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
-                        f"Convert this scene description into NovelAI/Danbooru-style image generation tags.\n"
-                        f"Scene: '{scene_text}'\n"
-                        f"Character already established: {nai_tags}\n\n"
-                        f"Output ONLY comma-separated lowercase Danbooru tags describing the scene: "
-                        f"action/pose, setting/background, lighting, mood, clothing state, "
-                        f"any relevant adult content details. "
-                        f"Do NOT repeat character appearance tags already listed above. "
-                        f"No sentences, no preamble, just tags. Max 20 tags."
+                        f"Analyse this scene and output a JSON object with exactly these keys:\n"
+                        f"- 'scene_tags': comma-separated Danbooru tags for setting, action, lighting, "
+                        f"mood, and explicit content — NO character appearance tags here\n"
+                        f"- 'extra_chars': list of strings, one per additional character beyond the main one. "
+                        f"Each string is comma-separated Danbooru appearance tags for that character. "
+                        f"Empty list [] if only the main character appears.\n\n"
+                        f"Main character (already established, do not repeat in scene_tags): {main_char_tags}\n"
+                        f"Scene: '{scene_text}'\n\n"
+                        f"Output raw JSON only. No markdown, no explanation.\n"
+                        f"Example: {{\"scene_tags\": \"beach, sunset, splashing water, laughing\", "
+                        f"\"extra_chars\": [\"1girl, short black hair, red bikini\"]}}"
                     ),
                 },
             ],
         )
-        return response.choices[0].message.content.strip()
+        raw = response.choices[0].message.content.strip()
+        # Strip markdown fences if present
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        import json
+        parsed = json.loads(raw)
+        return {
+            "scene_tags":  parsed.get("scene_tags", scene_text[:200]),
+            "extra_chars": parsed.get("extra_chars", []),
+        }
     except Exception as e:
-        logger.warning(f"Scene-to-tags conversion failed: {e}")
-        return scene_text[:200]
-        logger.warning(f"Scene-to-tags conversion failed: {e}")
-        # Fall back to the raw scene text
-        return scene_text[:200]
+        logger.warning(f"Structured scene parsing failed: {e} — falling back to plain tags")
+        return {"scene_tags": scene_text[:200], "extra_chars": []}
 
 
-async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> str:
-    """Build a NovelAI V3 prompt by rewriting the player's scene into Danbooru tags."""
-    quality_tags = "masterpiece, best quality, highly detailed, anime style, explicit"
-    nai_tags     = comic.get("nai_tags", "")
-    char_tags    = f"{nai_tags}, " if nai_tags else ""
+async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
+    """Build a fully structured NovelAI V4.5 prompt dict with char_captions.
 
-    scene_tags = await _scene_to_nai_tags(scene_text, nai_tags)
+    Returns a dict with:
+      'input'       : flat prompt string (for the top-level 'input' field)
+      'char_captions': list of {"char_caption": str} dicts for v4_prompt
+    """
+    quality_tags  = "masterpiece, best quality, highly detailed, explicit"
+    nai_tags      = comic.get("nai_tags", "")
 
-    return f"{quality_tags}, {char_tags}{scene_tags}"
+    structured    = await _scene_to_nai_structured(scene_text, nai_tags)
+    scene_tags    = structured["scene_tags"]
+    extra_chars   = structured["extra_chars"]
+
+    # Base input prompt = quality + scene (no character appearance here)
+    input_prompt  = f"{quality_tags}, {scene_tags}"
+
+    # Build char_captions: main character first, then any extras
+    char_captions = []
+    if nai_tags:
+        char_captions.append({"char_caption": nai_tags})
+    for extra in extra_chars:
+        if extra.strip():
+            char_captions.append({"char_caption": extra.strip()})
+
+    return {
+        "input":        input_prompt,
+        "char_captions": char_captions,
+    }
 
 
 def _build_negative_prompt_adult() -> str:
-    """Standard negative prompt for NovelAI V4 adult generation."""
+    """Standard negative prompt for NovelAI V4.5 adult generation."""
     return (
         "lowres, bad anatomy, bad hands, text, error, missing fingers, "
         "extra digit, fewer digits, cropped, worst quality, low quality, "
         "normal quality, jpeg artifacts, signature, watermark, username, "
-        "blurry, extra people, cloned face, disfigured, gross proportions, "
+        "blurry, cloned face, disfigured, gross proportions, "
         "malformed limbs, missing arms, missing legs, extra arms, extra legs"
     )
 
 
 async def _generate_image_adult(
-    prompt: str,
+    prompt_data: dict | str,
     label: str = "",
     seed: int | None = None,
 ) -> tuple[bytes | None, str | None]:
-    """Generate adult anime image via NovelAI V4 (nai-diffusion-4-full).
-    V4 understands natural language far better than V3 and handles
-    multi-character scenes more reliably.
+    """Generate adult anime image via NovelAI V4.5 (nai-diffusion-4-5-full).
+    prompt_data can be:
+      - a dict from _build_panel_prompt_adult with 'input' and 'char_captions'
+      - a plain string (used for the origin image)
     Response is a msgpack stream — we parse it to extract the image bytes."""
     import httpx
-    logger.info(f"Generating adult image via NovelAI V4 [{label}]: {prompt[:200]}")
+    logger.info(f"Generating adult image via NovelAI V4.5 [{label}]")
     if not NOVELAI_API_KEY:
         return None, "⚠️ NovelAI API key not configured."
     try:
         actual_seed = seed if seed is not None else random.randint(0, 2**32 - 1)
+        neg         = _build_negative_prompt_adult()
 
-        # V4 uses v4_prompt / v4_negative_prompt structures
+        # Resolve input string and char_captions from prompt_data
+        if isinstance(prompt_data, dict):
+            input_str    = prompt_data.get("input", "")
+            char_captions = prompt_data.get("char_captions", [])
+        else:
+            input_str    = str(prompt_data)
+            char_captions = []
+
         payload = {
-            "input": prompt,
-            "model": "nai-diffusion-4-full",
+            "input":  input_str,
+            "model":  "nai-diffusion-4-5-full",
             "action": "generate",
             "parameters": {
-                "width": 1024,
-                "height": 1024,
-                "scale": 6.5,
+                "width":   1024,
+                "height":  1024,
+                "scale":   6.5,
                 "sampler": "k_euler_ancestral",
-                "steps": 28,
+                "steps":   28,
                 "n_samples": 1,
-                "seed": actual_seed,
-                "negative_prompt": _build_negative_prompt_adult(),
-                "params_version": 3,
+                "seed":    actual_seed,
+                "negative_prompt": neg,
+                "params_version":  3,
                 "v4_prompt": {
                     "caption": {
-                        "base_caption": prompt,
-                        "char_captions": [],
+                        "base_caption": input_str,
+                        "char_captions": char_captions,
                     },
                     "use_coords": False,
-                    "use_order": False,
+                    "use_order":  len(char_captions) > 1,  # order matters for multi-char
                 },
                 "v4_negative_prompt": {
                     "caption": {
-                        "base_caption": _build_negative_prompt_adult(),
+                        "base_caption": neg,
                         "char_captions": [],
                     },
                     "use_coords": False,
-                    "use_order": False,
+                    "use_order":  False,
                 },
-                "ucPreset": 0,
-                "qualityToggle": True,
-                "dynamic_thresholding": False,
-                "legacy": False,
-                "noise_schedule": "karras",
+                "ucPreset":              0,
+                "qualityToggle":         True,
+                "dynamic_thresholding":  False,
+                "legacy":                False,
+                "noise_schedule":        "karras",
                 "deliberate_euler_ancestral_bug": False,
-                "prefer_brownian": True,
+                "prefer_brownian":       True,
             },
         }
 
@@ -1546,8 +1594,8 @@ async def _generate_image_adult(
                 "https://image.novelai.net/ai/generate-image",
                 headers={
                     "authorization": f"Bearer {NOVELAI_API_KEY}",
-                    "content-type": "application/json",
-                    "accept": "application/x-msgpack",
+                    "content-type":  "application/json",
+                    "accept":        "application/zip",
                 },
                 json=payload,
             )
@@ -1557,14 +1605,13 @@ async def _generate_image_adult(
             logger.error(f"NovelAI API error {response.status_code}: {msg}")
             return None, f"⚠️ NovelAI API error {response.status_code}: {msg}"
 
-        # Parse msgpack stream — each frame is: 4-byte big-endian length + msgpack payload
-        image_bytes = _parse_novelai_msgpack(response.content)
-        if image_bytes is None:
-            return None, "⚠️ NovelAI V4: could not extract image from response stream."
+        import zipfile
+        with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
+            image_bytes = zf.read(zf.namelist()[0])
         return image_bytes, None
 
     except Exception as e:
-        logger.error(f"NovelAI V4 image generation failed [{label}]: {e}")
+        logger.error(f"NovelAI V4.5 image generation failed [{label}]: {e}")
         return None, f"⚠️ {e}"
 
 
@@ -1628,13 +1675,14 @@ def _extract_image_raw(data: bytes) -> bytes | None:
 # ---------------------------------------------------------------------------
 
 async def _generate_image(
-    prompt: str,
+    prompt: str | dict,
     label: str = "",
     fallback_prompt: str | None = None,
     adult_mode: bool = False,
     nai_seed: int | None = None,
 ) -> tuple[bytes | None, str | None]:
-    """Generate an image. Routes to NovelAI for adult mode, OpenAI otherwise."""
+    """Generate an image. Routes to NovelAI V4.5 for adult mode, OpenAI otherwise.
+    For adult mode, prompt may be a dict from _build_panel_prompt_adult."""
     if adult_mode:
         return await _generate_image_adult(prompt, label=label, seed=nai_seed)
 
