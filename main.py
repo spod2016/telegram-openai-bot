@@ -1513,8 +1513,7 @@ async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
     # Base input prompt = quality + scene (no character appearance here)
     input_prompt  = f"{quality_tags}, {scene_tags}"
 
-    # Build char_captions: main character first, then any extras.
-    # centers is required by NAI V4.5 even when use_coords=False.
+    # Build char_captions: main character first, then any extras
     char_captions = []
     if nai_tags:
         char_captions.append({"char_caption": nai_tags, "centers": [{"x": 0.5, "y": 0.5}]})
@@ -1637,7 +1636,7 @@ async def _generate_image_adult(
             )
 
         if response.status_code == 500 and reference_images:
-            # 500 with vibe refs: retry once without them (refs may be unsupported format)
+            # 500 with vibe refs: retry once without them
             logger.warning(f"NAI 500 with vibe refs [{label}] — retrying without references")
             params.pop("reference_image_multiple", None)
             params.pop("reference_strength_multiple", None)
@@ -1645,6 +1644,37 @@ async def _generate_image_adult(
             payload["parameters"] = params
             async with httpx.AsyncClient(timeout=120) as client2:
                 response = await client2.post(
+                    "https://image.novelai.net/ai/generate-image",
+                    headers={
+                        "authorization": f"Bearer {NOVELAI_API_KEY}",
+                        "content-type":  "application/json",
+                        "accept":        "application/zip",
+                    },
+                    json=payload,
+                )
+
+        if response.status_code == 500:
+            # Still 500 — simplify to plain text prompt with no char_captions structure
+            logger.warning(f"NAI 500 [{label}] — retrying with simplified plain prompt")
+            params["v4_prompt"] = {
+                "caption": {
+                    "base_caption": input_str,
+                    "char_captions": [],
+                },
+                "use_coords": False,
+                "use_order":  False,
+            }
+            params["v4_negative_prompt"] = {
+                "caption": {
+                    "base_caption": neg,
+                    "char_captions": [],
+                },
+                "use_coords": False,
+                "use_order":  False,
+            }
+            payload["parameters"] = params
+            async with httpx.AsyncClient(timeout=120) as client3:
+                response = await client3.post(
                     "https://image.novelai.net/ai/generate-image",
                     headers={
                         "authorization": f"Bearer {NOVELAI_API_KEY}",
