@@ -568,7 +568,7 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
         quality_tags = "masterpiece, best quality, highly detailed, explicit"
         image_prompt = {
             "input": f"{quality_tags}, {structured['scene_tags']}",
-            "char_captions": [{"char_caption": nai_tags}] if nai_tags else [],
+            "char_captions": [{"char_caption": nai_tags, "centers": [{"x": 0.5, "y": 0.5}]}] if nai_tags else [],
         }
     else:
         game["nai_tags"] = ""
@@ -1513,13 +1513,14 @@ async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
     # Base input prompt = quality + scene (no character appearance here)
     input_prompt  = f"{quality_tags}, {scene_tags}"
 
-    # Build char_captions: main character first, then any extras
+    # Build char_captions: main character first, then any extras.
+    # centers is required by NAI V4.5 even when use_coords=False.
     char_captions = []
     if nai_tags:
-        char_captions.append({"char_caption": nai_tags})
+        char_captions.append({"char_caption": nai_tags, "centers": [{"x": 0.5, "y": 0.5}]})
     for extra in extra_chars:
         if extra.strip():
-            char_captions.append({"char_caption": extra.strip()})
+            char_captions.append({"char_caption": extra.strip(), "centers": [{"x": 0.5, "y": 0.5}]})
 
     return {
         "input":        input_prompt,
