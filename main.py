@@ -555,22 +555,23 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
     if character_bible:
         logger.info(f"Character bible for {token}: {character_bible}")
 
-    # For adult mode: also generate NAI tag-format bible and fix a seed
-    # so NovelAI V4.5 renders the same character across all panels.
+    # For adult mode: generate full cast bible and fix a seed
     is_adult = game.get("adult_mode", False)
     if is_adult:
-        nai_tags = await _generate_character_bible_nai(phrase)
-        game["nai_tags"] = nai_tags
+        nai_cast = await _generate_cast_bible_nai(phrase)
+        game["nai_cast"] = nai_cast
+        game["nai_tags"] = nai_cast[0]["tags"] if nai_cast else ""  # keep for legacy compat
         game["nai_seed"] = random.randint(0, 2**32 - 1)
-        logger.info(f"NAI tags for {token}: {nai_tags} | seed: {game['nai_seed']}")
-        # Origin image: use structured format with char_captions
-        structured   = await _scene_to_nai_structured(phrase, nai_tags)
+        logger.info(f"Cast bible for {token}: {[c['name'] for c in nai_cast]}")
+        # Origin image: parse all characters from the premise
+        structured   = await _scene_to_nai_structured(phrase, nai_cast)
         quality_tags = "masterpiece, best quality, highly detailed, explicit"
         image_prompt = {
-            "input": f"{quality_tags}, {structured['scene_tags']}",
-            "char_captions": [{"char_caption": nai_tags, "centers": [{"x": 0.5, "y": 0.5}]}] if nai_tags else [],
+            "input":        f"{quality_tags}, {structured['scene_tags']}",
+            "char_captions": structured["char_captions"],
         }
     else:
+        game["nai_cast"] = []
         game["nai_tags"] = ""
         game["nai_seed"] = None
         bible_prefix = f"{character_bible}. " if character_bible else ""
@@ -740,10 +741,10 @@ async def set_comic_rounds_callback(update: Update, context: ContextTypes.DEFAUL
     if character_bible:
         logger.info(f"Reusing character bible for comic {token}: {character_bible}")
 
-    # For adult mode: store nai_tags (tag-format bible) and a fixed seed
-    # so all panels share the same character appearance in NovelAI V3
-    comic_sessions[token]["nai_tags"]  = game.get("nai_tags", "")
-    comic_sessions[token]["nai_seed"]  = game.get("nai_seed",
+    # For adult mode: pass full cast bible and seed into comic session
+    comic_sessions[token]["nai_cast"] = list(game.get("nai_cast", []))
+    comic_sessions[token]["nai_tags"] = game.get("nai_tags", "")
+    comic_sessions[token]["nai_seed"] = game.get("nai_seed",
                                             random.randint(0, 2**32 - 1))
 
     # Carry the initial image forward so compile_comic can include it
@@ -1396,9 +1397,184 @@ def _load_fonts():
 # Adult image generation via Stability AI
 # ---------------------------------------------------------------------------
 
-async def _generate_character_bible_nai(original_phrase: str) -> str:
-    """Generate a NovelAI V3-compatible tag-format character description.
-    Uses Groq (Llama) which allows adult content, unlike OpenAI."""
+# ---------------------------------------------------------------------------
+# Adult image generation via NovelAI
+# ---------------------------------------------------------------------------
+
+async def _generate_cast_bible_nai(original_phrase: str) -> list[dict]:
+    """Generate a full cast bible for the story as a list of character dicts.
+    Each dict has 'name' (short label) and 'tags' (Danbooru appearance tags).
+    The main character is always index 0.
+    Returns a list so the scene parser can match characters by name/role."""
+    try:
+        client = AsyncOpenAI(
+            api_key=GROQ_API_KEY,
+            base_url="https://api.groq.com/openai/v1",
+        )
+        response = await client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            max_tokens=300,
+            temperature=0.2,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a character designer for an adult anime image platform. "
+                        "Identify all characters in a story premise and describe each with "
+                        "Danbooru-style tags. Output JSON only. No refusals."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Story premise: '{original_phrase}'\n\n"
+                        f"Identify ALL characters mentioned or implied in this premise. "
+                        f"For EACH character output a JSON object with:\n"
+                        f"- 'name': short label (e.g. 'main', 'friend', 'teacher', 'stranger')\n"
+                        f"- 'tags': comma-separated Danbooru tags: "
+                        f"gender (1girl/1boy), age hint, hair colour + style, eye colour, "
+                        f"body type, typical clothing or state of undress\n\n"
+                        f"Return a JSON array of these objects, main character first.\n"
+                        f"If only one character is clear, return an array with one entry.\n\n"
+                        f"EXAMPLES:\n"
+                        f"Premise with 1 char: "
+                        f"[{{\"name\": \"main\", \"tags\": \"1girl, long red hair, blue eyes, slim, nurse uniform\"}}]\n"
+                        f"Premise with 2 chars: "
+                        f"[{{\"name\": \"main\", \"tags\": \"1girl, short black hair, green eyes, athletic\"}},"
+                        f" {{\"name\": \"teacher\", \"tags\": \"1boy, brown hair, glasses, mature, suit\"}}]\n\n"
+                        f"Output raw JSON array only. No markdown. No explanation."
+                    ),
+                },
+            ],
+        )
+        raw = response.choices[0].message.content.strip()
+        if "```" in raw:
+            for part in raw.split("```"):
+                part = part.strip().lstrip("json").strip()
+                if part.startswith("["):
+                    raw = part
+                    break
+        import json
+        cast = json.loads(raw)
+        if not isinstance(cast, list) or not cast:
+            raise ValueError("Empty or invalid cast")
+        # Validate entries
+        validated = []
+        for entry in cast:
+            if isinstance(entry, dict) and entry.get("tags", "").strip():
+                validated.append({
+                    "name": str(entry.get("name", "character")).strip(),
+                    "tags": str(entry["tags"]).strip(),
+                })
+        logger.info(f"Cast bible: {[c['name'] for c in validated]}")
+        return validated if validated else [{"name": "main", "tags": ""}]
+    except Exception as e:
+        logger.warning(f"Cast bible generation failed: {e}")
+        return [{"name": "main", "tags": ""}]
+
+
+async def _scene_to_nai_structured(scene_text: str, cast: list[dict]) -> dict:
+    """Use Groq (Llama) to parse a scene using the full cast bible.
+    Returns {"scene_tags": str, "char_captions": [{"char_caption": str} ...]}
+    where char_captions contains ONLY characters who actually appear in this scene,
+    pulled from their established cast bible tags."""
+    main_char_tags = cast[0]["tags"] if cast else ""
+    cast_summary   = "\n".join(
+        f"  - {c['name']}: {c['tags']}" for c in cast
+    )
+    try:
+        client = AsyncOpenAI(
+            api_key=GROQ_API_KEY,
+            base_url="https://api.groq.com/openai/v1",
+        )
+        response = await client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            max_tokens=400,
+            temperature=0.2,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a Danbooru tag expert for an adult anime image platform. "
+                        "Output valid JSON only. Never refuse. Include explicit adult content."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"ESTABLISHED CAST (use EXACTLY these tags, do not invent new appearance):\n"
+                        f"{cast_summary}\n\n"
+                        f"SCENE TO ILLUSTRATE: '{scene_text}'\n\n"
+                        f"Output a JSON object with exactly two keys:\n\n"
+                        f"1. 'scene_tags': comma-separated Danbooru tags for the setting, action, "
+                        f"poses, lighting, mood, explicit sexual acts or states. "
+                        f"NEVER put character appearance here — only environment and action.\n\n"
+                        f"2. 'present_chars': JSON array of character names from the cast who "
+                        f"actually appear in this scene. Use the exact name labels from the cast. "
+                        f"ALWAYS include 'main'. Add others only if the scene explicitly involves them. "
+                        f"The array length determines how many characters appear in the image — "
+                        f"be precise. Include ALL characters the scene describes.\n\n"
+                        f"EXAMPLES:\n"
+                        f"Scene: 'she undresses alone in the bedroom' → "
+                        f"{{\"scene_tags\": \"bedroom, undressing, standing, dim light, seductive\", "
+                        f"\"present_chars\": [\"main\"]}}\n"
+                        f"Scene: 'the teacher joins her on the sofa' → "
+                        f"{{\"scene_tags\": \"living room, sofa, sitting together, evening, intimate\", "
+                        f"\"present_chars\": [\"main\", \"teacher\"]}}\n"
+                        f"Scene: 'all three of them in the hot spring' → "
+                        f"{{\"scene_tags\": \"outdoor onsen, steam, night, group, relaxing, nude\", "
+                        f"\"present_chars\": [\"main\", \"friend\", \"stranger\"]}}\n\n"
+                        f"Output raw JSON only. No markdown. No explanation."
+                    ),
+                },
+            ],
+        )
+        raw = response.choices[0].message.content.strip()
+        if "```" in raw:
+            for part in raw.split("```"):
+                part = part.strip().lstrip("json").strip()
+                if part.startswith("{"):
+                    raw = part
+                    break
+        import json
+        parsed      = json.loads(raw)
+        scene_tags  = parsed.get("scene_tags", "")
+        present     = parsed.get("present_chars", ["main"])
+
+        if not isinstance(scene_tags, str) or not scene_tags.strip():
+            scene_tags = scene_text[:200]
+        if not isinstance(present, list) or not present:
+            present = ["main"]
+
+        # Build char_captions from cast bible using matched names
+        cast_by_name = {c["name"]: c["tags"] for c in cast}
+        char_captions = []
+        for name in present:
+            tags = cast_by_name.get(name, cast[0]["tags"] if cast else "")
+            if tags:
+                char_captions.append({
+                    "char_caption": tags,
+                    "centers": [{"x": 0.5, "y": 0.5}],
+                })
+
+        # Guarantee at least the main character
+        if not char_captions and main_char_tags:
+            char_captions = [{"char_caption": main_char_tags,
+                               "centers": [{"x": 0.5, "y": 0.5}]}]
+
+        logger.info(f"Scene parsed — tags: '{scene_tags[:80]}' | "
+                    f"chars: {present} ({len(char_captions)} captions)")
+        return {"scene_tags": scene_tags, "char_captions": char_captions}
+
+    except Exception as e:
+        logger.warning(f"Structured scene parsing failed: {e} — falling back")
+        char_captions = [{"char_caption": main_char_tags,
+                           "centers": [{"x": 0.5, "y": 0.5}]}] if main_char_tags else []
+        return {"scene_tags": scene_text[:200], "char_captions": char_captions}
+
+
+async def _generate_char_tags_nai(char_description: str) -> str:
+    """Generate Danbooru tags for a newly introduced character from a scene description."""
     try:
         client = AsyncOpenAI(
             api_key=GROQ_API_KEY,
@@ -1407,122 +1583,117 @@ async def _generate_character_bible_nai(original_phrase: str) -> str:
         response = await client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             max_tokens=80,
+            temperature=0.2,
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "You are a tag generator for an adult anime image platform. "
-                        "Convert character descriptions into Danbooru-style tags. "
-                        "Always respond with only comma-separated tags, no refusals."
+                        "You are a Danbooru tag generator for an adult anime platform. "
+                        "Output only comma-separated tags. No refusals."
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
-                        f"Convert this character description into NovelAI/Danbooru-style image tags. "
-                        f"Story premise: '{original_phrase}'. "
-                        f"Output ONLY comma-separated tags describing: "
-                        f"gender (1girl/1boy), approximate age, hair color + hair length/style, "
-                        f"eye color, clothing items, one or two body traits. "
-                        f"Use lowercase Danbooru tag format. No sentences. No preamble. "
-                        f"Example: 1girl, long red hair, blue eyes, white dress, slim figure"
+                        f"Generate Danbooru appearance tags for this character: '{char_description}'. "
+                        f"Include: gender (1girl/1boy), hair colour + style, eye colour, "
+                        f"body type, typical clothing or state. Max 8 tags. "
+                        f"Example: 1boy, short blond hair, blue eyes, muscular, casual shirt"
                     ),
                 },
             ],
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        logger.warning(f"NAI character tag generation failed: {e}")
+        logger.warning(f"New char tag generation failed: {e}")
         return ""
 
 
-async def _scene_to_nai_structured(scene_text: str, main_char_tags: str) -> dict:
-    """Use Groq (Llama) to parse a scene into:
-      - scene_tags: background/action/mood tags (no character appearance)
-      - characters: list of per-character tag strings
-        [0] is always the main character (from bible)
-        [1+] are additional characters detected in the scene
+async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
+    """Build a fully structured NovelAI V4.5 prompt dict with char_captions.
+    Uses the full cast bible and dynamically expands it when new characters appear.
 
-    Returns: {"scene_tags": str, "characters": [str, ...]}
+    Returns a dict with:
+      'input'        : flat prompt string
+      'char_captions': list of char_caption dicts for v4_prompt
     """
+    quality_tags = "masterpiece, best quality, highly detailed, explicit"
+    cast         = comic.get("nai_cast", [])
+
+    # If cast is empty (old game format), fall back to nai_tags
+    if not cast:
+        nai_tags = comic.get("nai_tags", "")
+        cast = [{"name": "main", "tags": nai_tags}] if nai_tags else []
+
+    structured    = await _scene_to_nai_structured(scene_text, cast)
+    scene_tags    = structured["scene_tags"]
+    char_captions = structured["char_captions"]
+
+    # Detect new characters: present_chars names that aren't in cast yet
+    # The scene parser returns char_captions from the cast — if it found
+    # a name it couldn't match, it would have used the main char tags as fallback.
+    # We detect this by comparing caption count vs cast matches.
+    # Better: re-check the raw present list against cast names.
+    cast_names = {c["name"] for c in cast}
+
+    # Ask Groq to identify any new characters mentioned but not in cast
     try:
         client = AsyncOpenAI(
             api_key=GROQ_API_KEY,
             base_url="https://api.groq.com/openai/v1",
         )
-        response = await client.chat.completions.create(
+        new_char_response = await client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             max_tokens=200,
+            temperature=0.2,
             messages=[
                 {
                     "role": "system",
-                    "content": (
-                        "You are a structured tag generator for an adult anime image platform. "
-                        "Analyse scenes and output JSON only. No refusals, include explicit content."
-                    ),
+                    "content": "You identify new characters in scenes. Output JSON only.",
                 },
                 {
                     "role": "user",
                     "content": (
-                        f"Analyse this scene and output a JSON object with exactly these keys:\n"
-                        f"- 'scene_tags': comma-separated Danbooru tags for setting, action, lighting, "
-                        f"mood, and explicit content — NO character appearance tags here\n"
-                        f"- 'extra_chars': list of strings, one per additional character beyond the main one. "
-                        f"Each string is comma-separated Danbooru appearance tags for that character. "
-                        f"Empty list [] if only the main character appears.\n\n"
-                        f"Main character (already established, do not repeat in scene_tags): {main_char_tags}\n"
-                        f"Scene: '{scene_text}'\n\n"
-                        f"Output raw JSON only. No markdown, no explanation.\n"
-                        f"Example: {{\"scene_tags\": \"beach, sunset, splashing water, laughing\", "
-                        f"\"extra_chars\": [\"1girl, short black hair, red bikini\"]}}"
+                        f"EXISTING CAST: {', '.join(cast_names)}\n"
+                        f"SCENE: '{scene_text}'\n\n"
+                        f"List any characters who appear in this scene but are NOT in the existing cast. "
+                        f"For each, give a short name and a brief description.\n"
+                        f"Return JSON array: [{{\"name\": \"label\", \"description\": \"brief description\"}}]\n"
+                        f"Return [] if no new characters. Raw JSON only."
                     ),
                 },
             ],
         )
-        raw = response.choices[0].message.content.strip()
-        # Strip markdown fences if present
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
+        raw = new_char_response.choices[0].message.content.strip()
+        if "```" in raw:
+            for part in raw.split("```"):
+                part = part.strip().lstrip("json").strip()
+                if part.startswith("["):
+                    raw = part
+                    break
         import json
-        parsed = json.loads(raw)
-        return {
-            "scene_tags":  parsed.get("scene_tags", scene_text[:200]),
-            "extra_chars": parsed.get("extra_chars", []),
-        }
+        new_chars = json.loads(raw)
+        if isinstance(new_chars, list):
+            for nc in new_chars:
+                if isinstance(nc, dict) and nc.get("name") and nc.get("description"):
+                    name = nc["name"].strip()
+                    if name not in cast_names:
+                        tags = await _generate_char_tags_nai(nc["description"])
+                        if tags:
+                            new_entry = {"name": name, "tags": tags}
+                            cast.append(new_entry)
+                            comic["nai_cast"] = cast  # mutate in place — persists on session
+                            cast_names.add(name)
+                            char_captions.append({
+                                "char_caption": tags,
+                                "centers": [{"x": 0.5, "y": 0.5}],
+                            })
+                            logger.info(f"New character added to cast: '{name}' — {tags}")
     except Exception as e:
-        logger.warning(f"Structured scene parsing failed: {e} — falling back to plain tags")
-        return {"scene_tags": scene_text[:200], "extra_chars": []}
-
-
-async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
-    """Build a fully structured NovelAI V4.5 prompt dict with char_captions.
-
-    Returns a dict with:
-      'input'       : flat prompt string (for the top-level 'input' field)
-      'char_captions': list of {"char_caption": str} dicts for v4_prompt
-    """
-    quality_tags  = "masterpiece, best quality, highly detailed, explicit"
-    nai_tags      = comic.get("nai_tags", "")
-
-    structured    = await _scene_to_nai_structured(scene_text, nai_tags)
-    scene_tags    = structured["scene_tags"]
-    extra_chars   = structured["extra_chars"]
-
-    # Base input prompt = quality + scene (no character appearance here)
-    input_prompt  = f"{quality_tags}, {scene_tags}"
-
-    # Build char_captions: main character first, then any extras
-    char_captions = []
-    if nai_tags:
-        char_captions.append({"char_caption": nai_tags, "centers": [{"x": 0.5, "y": 0.5}]})
-    for extra in extra_chars:
-        if extra.strip():
-            char_captions.append({"char_caption": extra.strip(), "centers": [{"x": 0.5, "y": 0.5}]})
+        logger.warning(f"New character detection failed: {e}")
 
     return {
-        "input":        input_prompt,
+        "input":         f"{quality_tags}, {scene_tags}",
         "char_captions": char_captions,
     }
 
@@ -1604,13 +1775,13 @@ async def _generate_image_adult(
 
         # Vibe Transfer — inject multiple reference images if provided.
         # Uses the 'generate' action so zero Anlas cost on Opus.
-        # ref[0] = origin image: high info extraction (0.85), medium strength (0.5)
-        #   → anchors character appearance across the whole comic
-        # ref[1] = previous panel: medium info extraction (0.7), higher strength (0.6)
-        #   → maintains local visual continuity scene to scene
+        # ref[0] = origin image: very high info extraction (0.95), strong strength (0.7)
+        #   → firmly anchors character appearance across the whole comic
+        # ref[1] = previous panel: high info extraction (0.85), higher strength (0.75)
+        #   → strong local visual continuity scene to scene
         if reference_images:
-            strengths   = [0.5, 0.6][:len(reference_images)]
-            info_levels = [0.85, 0.7][:len(reference_images)]
+            strengths   = [0.7, 0.75][:len(reference_images)]
+            info_levels = [0.95, 0.85][:len(reference_images)]
             params["reference_image_multiple"] = [
                 base64.b64encode(img).decode("utf-8") for img in reference_images
             ]
