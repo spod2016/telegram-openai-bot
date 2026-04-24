@@ -1474,12 +1474,13 @@ async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> str:
 
 
 def _build_negative_prompt_adult() -> str:
-    """Standard negative prompt for NovelAI V3 adult generation."""
+    """Standard negative prompt for NovelAI V4 adult generation."""
     return (
         "lowres, bad anatomy, bad hands, text, error, missing fingers, "
         "extra digit, fewer digits, cropped, worst quality, low quality, "
         "normal quality, jpeg artifacts, signature, watermark, username, "
-        "blurry, multiple characters, extra people"
+        "blurry, extra people, cloned face, disfigured, gross proportions, "
+        "malformed limbs, missing arms, missing legs, extra arms, extra legs"
     )
 
 
@@ -1488,58 +1489,138 @@ async def _generate_image_adult(
     label: str = "",
     seed: int | None = None,
 ) -> tuple[bytes | None, str | None]:
-    """Generate adult anime image via NovelAI V3.
-    Pass a fixed seed to keep character appearance consistent across panels."""
+    """Generate adult anime image via NovelAI V4 (nai-diffusion-4-full).
+    V4 understands natural language far better than V3 and handles
+    multi-character scenes more reliably.
+    Response is a msgpack stream — we parse it to extract the image bytes."""
     import httpx
-    logger.info(f"Generating adult image via NovelAI [{label}]: {prompt[:200]}")
+    logger.info(f"Generating adult image via NovelAI V4 [{label}]: {prompt[:200]}")
     if not NOVELAI_API_KEY:
         return None, "⚠️ NovelAI API key not configured."
     try:
         actual_seed = seed if seed is not None else random.randint(0, 2**32 - 1)
+
+        # V4 uses v4_prompt / v4_negative_prompt structures
         payload = {
             "input": prompt,
-            "model": "nai-diffusion-3",
+            "model": "nai-diffusion-4-full",
             "action": "generate",
             "parameters": {
                 "width": 1024,
                 "height": 1024,
-                "scale": 6.0,
+                "scale": 6.5,
                 "sampler": "k_euler_ancestral",
                 "steps": 28,
                 "n_samples": 1,
                 "seed": actual_seed,
                 "negative_prompt": _build_negative_prompt_adult(),
+                "params_version": 3,
+                "v4_prompt": {
+                    "caption": {
+                        "base_caption": prompt,
+                        "char_captions": [],
+                    },
+                    "use_coords": False,
+                    "use_order": False,
+                },
+                "v4_negative_prompt": {
+                    "caption": {
+                        "base_caption": _build_negative_prompt_adult(),
+                        "char_captions": [],
+                    },
+                    "use_coords": False,
+                    "use_order": False,
+                },
                 "ucPreset": 0,
                 "qualityToggle": True,
-                "sm": False,
-                "sm_dyn": False,
                 "dynamic_thresholding": False,
                 "legacy": False,
                 "noise_schedule": "karras",
+                "deliberate_euler_ancestral_bug": False,
+                "prefer_brownian": True,
             },
         }
+
         async with httpx.AsyncClient(timeout=120) as client:
             response = await client.post(
                 "https://image.novelai.net/ai/generate-image",
                 headers={
                     "authorization": f"Bearer {NOVELAI_API_KEY}",
                     "content-type": "application/json",
-                    "accept": "application/zip",
+                    "accept": "application/x-msgpack",
                 },
                 json=payload,
             )
-        if response.status_code == 200:
-            import zipfile
-            with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
-                image_bytes = zf.read(zf.namelist()[0])
-            return image_bytes, None
-        else:
+
+        if response.status_code != 200:
             msg = response.text[:300]
             logger.error(f"NovelAI API error {response.status_code}: {msg}")
             return None, f"⚠️ NovelAI API error {response.status_code}: {msg}"
+
+        # Parse msgpack stream — each frame is: 4-byte big-endian length + msgpack payload
+        image_bytes = _parse_novelai_msgpack(response.content)
+        if image_bytes is None:
+            return None, "⚠️ NovelAI V4: could not extract image from response stream."
+        return image_bytes, None
+
     except Exception as e:
-        logger.error(f"NovelAI image generation failed [{label}]: {e}")
+        logger.error(f"NovelAI V4 image generation failed [{label}]: {e}")
         return None, f"⚠️ {e}"
+
+
+def _parse_novelai_msgpack(data: bytes) -> bytes | None:
+    """Extract the first PNG/JPEG image from a NovelAI V4 msgpack stream.
+
+    The stream format is a sequence of frames:
+        [4 bytes big-endian length][msgpack-encoded dict]
+    Each dict has an 'event' key and optionally a 'data' key containing
+    the base64-encoded image when event == 'newImage'.
+    """
+    import struct
+
+    try:
+        import msgpack
+    except ImportError:
+        # msgpack not installed — fall back to raw scan for PNG/JPEG magic bytes
+        logger.warning("msgpack not installed, falling back to raw image scan")
+        return _extract_image_raw(data)
+
+    offset = 0
+    while offset < len(data):
+        if offset + 4 > len(data):
+            break
+        frame_len = struct.unpack(">I", data[offset:offset + 4])[0]
+        offset += 4
+        if offset + frame_len > len(data):
+            break
+        frame_data = data[offset:offset + frame_len]
+        offset += frame_len
+
+        try:
+            frame = msgpack.unpackb(frame_data, raw=False)
+            event = frame.get("event", "")
+            if event == "newImage":
+                img_b64 = frame.get("data", "")
+                if img_b64:
+                    return base64.b64decode(img_b64)
+        except Exception:
+            continue
+
+    # No newImage event found — try raw scan as last resort
+    return _extract_image_raw(data)
+
+
+def _extract_image_raw(data: bytes) -> bytes | None:
+    """Last-resort: scan for PNG or JPEG magic bytes in raw response data."""
+    # PNG magic: \x89PNG
+    png_idx = data.find(b"\x89PNG")
+    if png_idx != -1:
+        return data[png_idx:]
+    # JPEG magic: \xff\xd8\xff
+    jpg_idx = data.find(b"\xff\xd8\xff")
+    if jpg_idx != -1:
+        return data[jpg_idx:]
+    return None
 
 
 # ---------------------------------------------------------------------------
