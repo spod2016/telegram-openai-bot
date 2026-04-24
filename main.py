@@ -833,8 +833,22 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
     is_adult = comic.get("adult_mode", False)
     if is_adult:
         prompt = await _build_panel_prompt_adult(comic, scene_text)
+
+        # Build Vibe Transfer references: origin image + last successful panel
+        # Origin anchors character appearance; previous panel ensures local continuity.
+        nai_refs = []
+        origin = comic.get("initial_image_data")
+        if origin:
+            nai_refs.append(origin)
+        # Find most recent non-skipped panel
+        for p in reversed(comic["panels"]):
+            if not p.get("skipped") and p.get("image_data"):
+                nai_refs.append(p["image_data"])
+                break
     else:
-        prompt = _build_panel_prompt(comic, scene_text, panel_num)
+        prompt   = _build_panel_prompt(comic, scene_text, panel_num)
+        nai_refs = None
+
     fallback = _build_panel_fallback_prompt(comic, scene_text)
     image_data, image_error = await _generate_image(
         prompt,
@@ -842,6 +856,7 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
         fallback_prompt=fallback,
         adult_mode=is_adult,
         nai_seed=comic.get("nai_seed"),
+        nai_references=nai_refs if is_adult else None,
     )
 
     # Any failure — offer one retry, then auto-skip
@@ -1527,14 +1542,17 @@ async def _generate_image_adult(
     prompt_data: dict | str,
     label: str = "",
     seed: int | None = None,
+    reference_images: list[bytes] | None = None,
 ) -> tuple[bytes | None, str | None]:
     """Generate adult anime image via NovelAI V4.5 (nai-diffusion-4-5-full).
     prompt_data can be:
       - a dict from _build_panel_prompt_adult with 'input' and 'char_captions'
       - a plain string (used for the origin image)
-    Response is a msgpack stream — we parse it to extract the image bytes."""
+    reference_images: optional list of 1 or 2 raw image bytes to use as Vibe Transfer
+      references. Stays within the 'generate' action so Opus users pay zero Anlas."""
     import httpx
-    logger.info(f"Generating adult image via NovelAI V4.5 [{label}]")
+    logger.info(f"Generating adult image via NovelAI V4.5 [{label}] "
+                f"({'with' if reference_images else 'no'} vibe refs)")
     if not NOVELAI_API_KEY:
         return None, "⚠️ NovelAI API key not configured."
     try:
@@ -1543,50 +1561,67 @@ async def _generate_image_adult(
 
         # Resolve input string and char_captions from prompt_data
         if isinstance(prompt_data, dict):
-            input_str    = prompt_data.get("input", "")
+            input_str     = prompt_data.get("input", "")
             char_captions = prompt_data.get("char_captions", [])
         else:
-            input_str    = str(prompt_data)
+            input_str     = str(prompt_data)
             char_captions = []
 
-        payload = {
-            "input":  input_str,
-            "model":  "nai-diffusion-4-5-full",
-            "action": "generate",
-            "parameters": {
-                "width":   1024,
-                "height":  1024,
-                "scale":   6.5,
-                "sampler": "k_euler_ancestral",
-                "steps":   28,
-                "n_samples": 1,
-                "seed":    actual_seed,
-                "negative_prompt": neg,
-                "params_version":  3,
-                "v4_prompt": {
-                    "caption": {
-                        "base_caption": input_str,
-                        "char_captions": char_captions,
-                    },
-                    "use_coords": False,
-                    "use_order":  len(char_captions) > 1,  # order matters for multi-char
+        params = {
+            "width":   1024,
+            "height":  1024,
+            "scale":   6.5,
+            "sampler": "k_euler_ancestral",
+            "steps":   28,
+            "n_samples": 1,
+            "seed":    actual_seed,
+            "negative_prompt": neg,
+            "params_version":  3,
+            "v4_prompt": {
+                "caption": {
+                    "base_caption": input_str,
+                    "char_captions": char_captions,
                 },
-                "v4_negative_prompt": {
-                    "caption": {
-                        "base_caption": neg,
-                        "char_captions": [],
-                    },
-                    "use_coords": False,
-                    "use_order":  False,
-                },
-                "ucPreset":              0,
-                "qualityToggle":         True,
-                "dynamic_thresholding":  False,
-                "legacy":                False,
-                "noise_schedule":        "karras",
-                "deliberate_euler_ancestral_bug": False,
-                "prefer_brownian":       True,
+                "use_coords": False,
+                "use_order":  len(char_captions) > 1,
             },
+            "v4_negative_prompt": {
+                "caption": {
+                    "base_caption": neg,
+                    "char_captions": [],
+                },
+                "use_coords": False,
+                "use_order":  False,
+            },
+            "ucPreset":              0,
+            "qualityToggle":         True,
+            "dynamic_thresholding":  False,
+            "legacy":                False,
+            "noise_schedule":        "karras",
+            "deliberate_euler_ancestral_bug": False,
+            "prefer_brownian":       True,
+        }
+
+        # Vibe Transfer — inject multiple reference images if provided.
+        # Uses the 'generate' action so zero Anlas cost on Opus.
+        # ref[0] = origin image: high info extraction (0.85), medium strength (0.5)
+        #   → anchors character appearance across the whole comic
+        # ref[1] = previous panel: medium info extraction (0.7), higher strength (0.6)
+        #   → maintains local visual continuity scene to scene
+        if reference_images:
+            strengths   = [0.5, 0.6][:len(reference_images)]
+            info_levels = [0.85, 0.7][:len(reference_images)]
+            params["reference_image_multiple"] = [
+                base64.b64encode(img).decode("utf-8") for img in reference_images
+            ]
+            params["reference_strength_multiple"]             = strengths
+            params["reference_information_extracted_multiple"] = info_levels
+
+        payload = {
+            "input":      input_str,
+            "model":      "nai-diffusion-4-5-full",
+            "action":     "generate",
+            "parameters": params,
         }
 
         async with httpx.AsyncClient(timeout=120) as client:
@@ -1680,11 +1715,18 @@ async def _generate_image(
     fallback_prompt: str | None = None,
     adult_mode: bool = False,
     nai_seed: int | None = None,
+    nai_references: list[bytes] | None = None,
 ) -> tuple[bytes | None, str | None]:
     """Generate an image. Routes to NovelAI V4.5 for adult mode, OpenAI otherwise.
-    For adult mode, prompt may be a dict from _build_panel_prompt_adult."""
+    For adult mode, prompt may be a dict from _build_panel_prompt_adult.
+    nai_references: optional list of raw image bytes for Vibe Transfer."""
     if adult_mode:
-        return await _generate_image_adult(prompt, label=label, seed=nai_seed)
+        return await _generate_image_adult(
+            prompt,
+            label=label,
+            seed=nai_seed,
+            reference_images=nai_references,
+        )
 
     logger.info(f"Generating image [{label}]: {prompt[:200]}")
     client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=120.0, max_retries=1)
