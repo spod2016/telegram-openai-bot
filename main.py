@@ -44,8 +44,11 @@ GAME_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "game_l
 _game_log_lock = threading.Lock()
 
 def log_game_event(event: str, data: dict) -> None:
-    """Append a JSON line to the persistent game log. Thread-safe."""
+    """Append a JSON line to the persistent game log and emit to deployment logs."""
     record = {"event": event, "ts": datetime.utcnow().isoformat(), **data}
+    # Always emit to deployment logs (queryable via log tooling)
+    logger.info("GAME_EVENT: " + _json.dumps(record, ensure_ascii=False))
+    # Also write to local file (persists on deployed VM)
     try:
         with _game_log_lock:
             with open(GAME_LOG_FILE, "a", encoding="utf-8") as f:
@@ -2164,9 +2167,26 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
+        if self.path == "/logs":
+            try:
+                with _game_log_lock:
+                    if os.path.exists(GAME_LOG_FILE):
+                        with open(GAME_LOG_FILE, "r", encoding="utf-8") as f:
+                            body = f.read().encode("utf-8")
+                    else:
+                        body = b""
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-ndjson")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as exc:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(str(exc).encode())
+        else:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
 
     def log_message(self, format, *args):
         pass
