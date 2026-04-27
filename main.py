@@ -673,12 +673,14 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
                     parse_mode="HTML",
                 )
             else:
+                safe_error = (error_msg or "Unknown error.")
+                safe_error = safe_error.replace("<", "‹").replace(">", "›")
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
                         result_text
                         + "\n\n❌ <b>Image generation failed — the game cannot continue.</b>\n"
-                        + (error_msg or "Unknown error.")
+                        + safe_error
                         + "\n\nPlease start a new game with /create."
                     ),
                     parse_mode="HTML",
@@ -1047,12 +1049,13 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     caption=panel_caption, parse_mode="HTML",
                 )
             else:
+                safe_err = (image_error or "Unknown error.").replace("<", "‹").replace(">", "›")
                 await context.bot.send_message(
                     chat_id=pid,
                     text=(
                         panel_caption
                         + "\n\n⚠️ <b>Image generation failed for this panel.</b>\n"
-                        + (image_error or "Unknown error.")
+                        + safe_err
                     ),
                     parse_mode="HTML",
                 )
@@ -2058,20 +2061,50 @@ async def _generate_image_adult(
             logger.error(f"NovelAI API error {response.status_code}: {msg}")
             return None, f"⚠️ NovelAI API error {response.status_code}: {msg}"
 
-        # Try msgpack parsing first (V4.5 native format), fall back to ZIP
-        image_bytes = _parse_novelai_msgpack(response.content)
+        # --- Multi-format response parsing ---
+        # Try every known NovelAI response format in order, log which one succeeds.
+        # This handles V4.5 silently changing format or ignoring our accept header.
+        raw = response.content
+        content_type = response.headers.get("content-type", "unknown")
+        logger.info(f"NAI 200 response [{label}] — content-type: {content_type}, "
+                    f"size: {len(raw)} bytes, first4: {raw[:4].hex()}")
+
+        image_bytes = None
+        parse_method = None
+
+        # 1. Try msgpack framed stream (V4/V4.5 native when accept=msgpack)
+        image_bytes = _parse_novelai_msgpack(raw)
+        if image_bytes:
+            parse_method = "msgpack"
+
+        # 2. Try ZIP (V3 format, still used by some V4.5 responses)
         if image_bytes is None:
-            # Fallback: try ZIP
             try:
                 import zipfile
-                with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
-                    image_bytes = zf.read(zf.namelist()[0])
-                logger.info(f"Parsed response as ZIP [{label}]")
+                with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                    names = zf.namelist()
+                    if names:
+                        image_bytes = zf.read(names[0])
+                        parse_method = f"zip({names[0]})"
             except Exception:
                 pass
 
+        # 3. Try raw PNG scan (image embedded directly without framing)
         if image_bytes is None:
-            return None, "⚠️ NovelAI: could not parse image from response."
+            image_bytes = _extract_image_raw(raw)
+            if image_bytes:
+                parse_method = "raw_scan"
+
+        # 4. Try treating the entire response as a direct image
+        if image_bytes is None and len(raw) > 100:
+            image_bytes = raw
+            parse_method = "raw_direct"
+
+        if image_bytes is None:
+            logger.error(f"All parsers failed [{label}] — raw hex: {raw[:64].hex()}")
+            return None, "⚠️ NovelAI: could not parse image from response (all formats failed)."
+
+        logger.info(f"NAI image parsed via [{parse_method}] [{label}]")
 
         # Validate that the bytes are actually a readable image before returning.
         # Corrupt bytes would crash PIL downstream in _build_comic_strip.
