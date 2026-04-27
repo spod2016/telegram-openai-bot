@@ -530,11 +530,13 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
 
     who    = ordered_answers[0]
     action = ordered_answers[1] if len(ordered_answers) > 1 else "doing something"
-    where  = ordered_answers[2] if len(ordered_answers) > 2 else "somewhere"
+    where  = ordered_answers[2] if len(ordered_answers) > 2 else None
     mood   = ordered_answers[3] if len(ordered_answers) > 3 else None
     twist  = ordered_answers[4] if len(ordered_answers) > 4 else None
 
-    phrase = f"{who} is {action} in {where}"
+    phrase = f"{who} is {action}"
+    if where:
+        phrase += f" in {where}"
     if mood:
         phrase += f", with a {mood} atmosphere"
     if twist:
