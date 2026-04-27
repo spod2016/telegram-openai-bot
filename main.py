@@ -1337,8 +1337,12 @@ def _build_comic_strip(
         oy = PAD
 
         if initial_image_data:
-            orig_img = Image.open(io.BytesIO(initial_image_data)).convert("RGB")
-            orig_img = _resize_cover(orig_img, ow, ORIGIN_IMG_H)
+            try:
+                orig_img = Image.open(io.BytesIO(initial_image_data)).convert("RGB")
+                orig_img = _resize_cover(orig_img, ow, ORIGIN_IMG_H)
+            except Exception as e:
+                logger.error(f"Could not open origin image for strip: {e}")
+                orig_img = Image.new("RGB", (ow, ORIGIN_IMG_H), ORIGIN_BG)
         else:
             orig_img = Image.new("RGB", (ow, ORIGIN_IMG_H), ORIGIN_BG)
 
@@ -1365,9 +1369,17 @@ def _build_comic_strip(
             px = PAD + col * (PANEL_SIZE + PAD)
             py = grid_top + PAD + row * (PANEL_SIZE + CAPTION_H + PAD)
 
-            # Panel image
-            pimg = Image.open(io.BytesIO(panel["image_data"])).convert("RGB")
-            pimg = pimg.resize((PANEL_SIZE, PANEL_SIZE), Image.LANCZOS)
+            # Panel image — use placeholder if data is corrupt or missing
+            try:
+                pimg = Image.open(io.BytesIO(panel["image_data"])).convert("RGB")
+                pimg = pimg.resize((PANEL_SIZE, PANEL_SIZE), Image.LANCZOS)
+            except Exception as e:
+                logger.error(f"Could not open panel image for strip: {e}")
+                pimg = Image.new("RGB", (PANEL_SIZE, PANEL_SIZE), (50, 50, 60))
+                ph_draw = ImageDraw.Draw(pimg)
+                ph_draw.text((PANEL_SIZE // 2, PANEL_SIZE // 2),
+                             "⚠️ image\nunavailable",
+                             fill=(180, 180, 180), font=font_small, anchor="mm")
             canvas.paste(pimg, (px, py))
 
             # Border
@@ -2012,7 +2024,7 @@ async def _generate_image_adult(
         # Try msgpack parsing first (V4.5 native format), fall back to ZIP
         image_bytes = _parse_novelai_msgpack(response.content)
         if image_bytes is None:
-            # Fallback: try ZIP (some V4.5 configurations still return ZIP)
+            # Fallback: try ZIP
             try:
                 import zipfile
                 with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
@@ -2020,8 +2032,19 @@ async def _generate_image_adult(
                 logger.info(f"Parsed response as ZIP [{label}]")
             except Exception:
                 pass
+
         if image_bytes is None:
             return None, "⚠️ NovelAI: could not parse image from response."
+
+        # Validate that the bytes are actually a readable image before returning.
+        # Corrupt bytes would crash PIL downstream in _build_comic_strip.
+        try:
+            from PIL import Image as PilImage
+            PilImage.open(io.BytesIO(image_bytes)).verify()
+        except Exception as val_err:
+            logger.error(f"NAI returned unparseable image bytes [{label}]: {val_err}")
+            return None, f"⚠️ NovelAI returned invalid image data: {val_err}"
+
         return image_bytes, None
 
     except Exception as e:
