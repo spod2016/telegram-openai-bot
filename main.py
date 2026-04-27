@@ -948,13 +948,41 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     f"⚠️ <i>If your next prompt is blocked again, your turn will be skipped automatically.</i>"
                 )
             else:
+                # Sanitize error text — strip angle brackets so HTML parse_mode
+                # doesn't choke on raw Python object reprs like <_io.BytesIO ...>
+                safe_error = (image_error or "Unknown error.")
+                safe_error = safe_error.replace("<", "‹").replace(">", "›")
                 retry_msg = (
                     f"⚠️ <b>Image generation failed.</b>\n"
-                    f"{image_error or 'Unknown error.'}\n\n"
+                    f"{safe_error}\n\n"
                     f"Please try again with a different description.\n"
                     f"<i>If it fails again, your turn will be skipped automatically.</i>"
                 )
-            await update.message.reply_text(retry_msg, parse_mode="HTML")
+            try:
+                await update.message.reply_text(retry_msg, parse_mode="HTML")
+            except Exception as tg_err:
+                # If sending the retry message itself fails, don't freeze the game —
+                # fall through to auto-skip so subsequent panels can proceed.
+                logger.error(f"Failed to send retry message to {chat_id}: {tg_err}")
+                comic.pop("retry_player", None)
+                pending_comic_input.pop(chat_id, None)
+                author_name = comic["player_names"].get(chat_id, "A player")
+                for pid in comic["player_order"]:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=pid,
+                            text=f"⏭️ <b>Panel {panel_num} skipped.</b> {author_name}'s panel had an error.",
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
+                comic["panels"].append({
+                    "author_id":  chat_id,
+                    "prompt":     scene_text,
+                    "image_data": None,
+                    "skipped":    True,
+                })
+                await _advance_comic(context, token)
             return
         else:
             # Second failure — auto-skip
