@@ -750,6 +750,16 @@ async def set_comic_rounds_callback(update: Update, context: ContextTypes.DEFAUL
     # Carry the initial image forward so compile_comic can include it
     comic_sessions[token]["initial_image_data"] = game.get("initial_image_data")
 
+    # Per-character vibe reference map: char_tags → first image they appeared in
+    # Pre-populate main character with origin image
+    initial_img  = game.get("initial_image_data")
+    nai_cast     = game.get("nai_cast", [])
+    char_first_panel = {}
+    if initial_img and nai_cast:
+        main_tags = nai_cast[0]["tags"]
+        char_first_panel[main_tags] = initial_img
+    comic_sessions[token]["char_first_panel"] = char_first_panel
+
     # Notify non-host players
     for chat_id in game["player_order"]:
         if chat_id != host_id:
@@ -835,20 +845,36 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if is_adult:
         prompt = await _build_panel_prompt_adult(comic, scene_text)
 
-        # Build Vibe Transfer references: origin image + last successful panel
-        # Origin anchors character appearance; previous panel ensures local continuity.
+        # Build per-character vibe references from the char_first_panel map.
+        # For each character appearing in this scene, look up their first-appearance image.
+        # Priority: main character first (origin), then others in order of introduction.
+        # Cap at 4 references to avoid diluting the signal.
+        char_first_panel = comic.get("char_first_panel", {})
+        present_tags     = prompt.get("present_chars", [])
+
         nai_refs = []
+        seen     = set()
+
+        # Main character (origin image) always first and always included
         origin = comic.get("initial_image_data")
         if origin:
             nai_refs.append(origin)
-        # Find most recent non-skipped panel
-        for p in reversed(comic["panels"]):
-            if not p.get("skipped") and p.get("image_data"):
-                nai_refs.append(p["image_data"])
-                break
+            seen.add(id(origin))
+
+        # Additional characters in scene — their first-appearance image
+        for tag_str in present_tags:
+            ref = char_first_panel.get(tag_str)
+            if ref and id(ref) not in seen and len(nai_refs) < 4:
+                nai_refs.append(ref)
+                seen.add(id(ref))
+
+        # Seed: always use origin seed
+        panel_seed = comic.get("nai_seed")
+
     else:
-        prompt   = _build_panel_prompt(comic, scene_text, panel_num)
-        nai_refs = None
+        prompt     = _build_panel_prompt(comic, scene_text, panel_num)
+        nai_refs   = None
+        panel_seed = None
 
     fallback = _build_panel_fallback_prompt(comic, scene_text)
     image_data, image_error = await _generate_image(
@@ -856,7 +882,7 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
         label=f"panel {panel_num} of game {token}",
         fallback_prompt=fallback,
         adult_mode=is_adult,
-        nai_seed=None,   # random seed per panel — vibe transfer handles consistency
+        nai_seed=panel_seed,
         nai_references=nai_refs if is_adult else None,
     )
 
@@ -914,7 +940,17 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
         "prompt":     scene_text,
         "image_data": image_data,
         "skipped":    False,
+        "nai_seed":   panel_seed,
     })
+
+    # Update char_first_panel map: register the first image each character appears in.
+    # Characters already in the map keep their original first-appearance reference.
+    if is_adult and image_data and isinstance(prompt, dict):
+        char_first_panel = comic.setdefault("char_first_panel", {})
+        for tag_str in prompt.get("present_chars", []):
+            if tag_str and tag_str not in char_first_panel:
+                char_first_panel[tag_str] = image_data
+                logger.info(f"Registered first-appearance image for character: {tag_str[:60]}")
 
     # Broadcast panel to all players
     author_name   = comic["player_names"].get(chat_id, "A player")
@@ -1695,6 +1731,7 @@ async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
     return {
         "input":         f"{quality_tags}, {scene_tags}",
         "char_captions": char_captions,
+        "present_chars": [c["char_caption"] for c in char_captions],  # for vibe map
     }
 
 
@@ -1773,15 +1810,16 @@ async def _generate_image_adult(
             "prefer_brownian":       True,
         }
 
-        # Vibe Transfer — inject multiple reference images if provided.
-        # Uses the 'generate' action so zero Anlas cost on Opus.
-        # ref[0] = origin image: very high info extraction (0.95), strong strength (0.7)
-        #   → firmly anchors character appearance across the whole comic
-        # ref[1] = previous panel: high info extraction (0.85), higher strength (0.75)
-        #   → strong local visual continuity scene to scene
+        # Vibe Transfer weights:
+        # ref[0] = main character (origin) — dominant anchor, always highest
+        # ref[1+] = additional characters — progressively lower strength
+        # Cap at 4 refs; beyond that the signal gets too diluted.
         if reference_images:
-            strengths   = [0.7, 0.75][:len(reference_images)]
-            info_levels = [0.95, 0.85][:len(reference_images)]
+            n = len(reference_images)
+            # strengths: main=0.85, then 0.65, 0.55, 0.50 for additional chars
+            strengths   = ([0.85] + [max(0.5, 0.65 - i * 0.1) for i in range(n - 1)])[:n]
+            # info levels: main=0.98, then 0.80 for all others
+            info_levels = ([0.98] + [0.80] * (n - 1))[:n]
             params["reference_image_multiple"] = [
                 base64.b64encode(img).decode("utf-8") for img in reference_images
             ]
