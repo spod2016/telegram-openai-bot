@@ -615,9 +615,10 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
         # Origin image: parse all characters from the premise
         structured   = await _scene_to_nai_structured(phrase, nai_cast)
         quality_tags = "masterpiece, best quality, highly detailed, explicit"
+        char_caps    = structured["char_captions"]
         image_prompt = {
-            "input":        f"{quality_tags}, {structured['scene_tags']}",
-            "char_captions": structured["char_captions"],
+            "input":        f"{_char_count_prefix(char_caps)}{quality_tags}, {structured['scene_tags']}",
+            "char_captions": char_caps,
         }
     else:
         game["nai_cast"] = []
@@ -1558,6 +1559,55 @@ async def _generate_cast_bible_nai(original_phrase: str) -> list[dict]:
         return [{"name": "main", "tags": ""}]
 
 
+def _distributed_centers(n: int) -> list[list[dict]]:
+    """Return a list of n center coordinate lists, spread evenly across the canvas.
+    Each entry is a list containing one {x, y} dict (NovelAI format).
+
+    n=1: [0.5]
+    n=2: [0.3, 0.7]
+    n=3: [0.2, 0.5, 0.8]
+    n=4: [0.15, 0.38, 0.62, 0.85]
+    n=5+: evenly spaced between 0.1 and 0.9
+    """
+    if n <= 0:
+        return []
+    if n == 1:
+        xs = [0.5]
+    elif n == 2:
+        xs = [0.3, 0.7]
+    elif n == 3:
+        xs = [0.2, 0.5, 0.8]
+    elif n == 4:
+        xs = [0.15, 0.38, 0.62, 0.85]
+    else:
+        step = 0.8 / (n - 1)
+        xs = [round(0.1 + i * step, 2) for i in range(n)]
+    return [[{"x": x, "y": 0.5}] for x in xs]
+
+
+def _char_count_prefix(char_captions: list) -> str:
+    """Generate a character count summary for base_caption.
+    Reads gender tags from each char_caption to build a natural summary.
+    E.g. two chars with '1girl' and '1boy' → '1girl and 1boy, '
+    Falls back to count-based summary if tags are unclear."""
+    if not char_captions:
+        return ""
+    gender_tags = []
+    for cap in char_captions:
+        tags = cap.get("char_caption", "")
+        if "1girl" in tags:
+            gender_tags.append("1girl")
+        elif "1boy" in tags:
+            gender_tags.append("1boy")
+        elif "1other" in tags:
+            gender_tags.append("1other")
+    if gender_tags:
+        return " and ".join(gender_tags) + ", "
+    # Fallback: just the count
+    count_map = {1: "solo", 2: "2characters", 3: "3characters"}
+    return count_map.get(len(char_captions), f"{len(char_captions)}characters") + ", "
+
+
 async def _scene_to_nai_structured(scene_text: str, cast: list[dict]) -> dict:
     """Use Groq (Llama) to parse a scene using the full cast bible.
     Returns {"scene_tags": str, "char_captions": [{"char_caption": str} ...]}
@@ -1637,15 +1687,16 @@ async def _scene_to_nai_structured(scene_text: str, cast: list[dict]) -> dict:
         for name in present:
             tags = cast_by_name.get(name, cast[0]["tags"] if cast else "")
             if tags:
-                char_captions.append({
-                    "char_caption": tags,
-                    "centers": [{"x": 0.5, "y": 0.5}],
-                })
+                char_captions.append({"char_caption": tags})
 
         # Guarantee at least the main character
         if not char_captions and main_char_tags:
-            char_captions = [{"char_caption": main_char_tags,
-                               "centers": [{"x": 0.5, "y": 0.5}]}]
+            char_captions = [{"char_caption": main_char_tags}]
+
+        # Distribute centers across canvas to prevent character merging
+        centers = _distributed_centers(len(char_captions))
+        for i, cap in enumerate(char_captions):
+            cap["centers"] = centers[i]
 
         logger.info(f"Scene parsed — tags: '{scene_tags[:80]}' | "
                     f"chars: {present} ({len(char_captions)} captions)")
@@ -1654,7 +1705,7 @@ async def _scene_to_nai_structured(scene_text: str, cast: list[dict]) -> dict:
     except Exception as e:
         logger.warning(f"Structured scene parsing failed: {e} — falling back")
         char_captions = [{"char_caption": main_char_tags,
-                           "centers": [{"x": 0.5, "y": 0.5}]}] if main_char_tags else []
+                           "centers": _distributed_centers(1)[0]}] if main_char_tags else []
         return {"scene_tags": scene_text[:200], "char_captions": char_captions}
 
 
@@ -1767,20 +1818,21 @@ async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
                         if tags:
                             new_entry = {"name": name, "tags": tags}
                             cast.append(new_entry)
-                            comic["nai_cast"] = cast  # mutate in place — persists on session
+                            comic["nai_cast"] = cast
                             cast_names.add(name)
-                            char_captions.append({
-                                "char_caption": tags,
-                                "centers": [{"x": 0.5, "y": 0.5}],
-                            })
+                            char_captions.append({"char_caption": tags})
+                            # Redistribute centers for all chars including the new one
+                            centers = _distributed_centers(len(char_captions))
+                            for i, cap in enumerate(char_captions):
+                                cap["centers"] = centers[i]
                             logger.info(f"New character added to cast: '{name}' — {tags}")
     except Exception as e:
         logger.warning(f"New character detection failed: {e}")
 
     return {
-        "input":         f"{quality_tags}, {scene_tags}",
+        "input":         f"{_char_count_prefix(char_captions)}{quality_tags}, {scene_tags}",
         "char_captions": char_captions,
-        "present_chars": [c["char_caption"] for c in char_captions],  # for vibe map
+        "present_chars": [c["char_caption"] for c in char_captions],
     }
 
 
@@ -1859,21 +1911,29 @@ async def _generate_image_adult(
             "prefer_brownian":       True,
         }
 
-        # Vibe Transfer weights:
-        # ref[0] = main character (origin) — dominant anchor, always highest
-        # ref[1+] = additional characters — progressively lower strength
+        # Vibe Transfer weights — strengths MUST sum to ≤ 1.0 per NovelAI docs.
+        # Origin always gets the largest share; additional chars split the remainder.
         # Cap at 4 refs; beyond that the signal gets too diluted.
         if reference_images:
             n = len(reference_images)
-            # strengths: main=0.85, then 0.65, 0.55, 0.50 for additional chars
-            strengths   = ([0.85] + [max(0.5, 0.65 - i * 0.1) for i in range(n - 1)])[:n]
-            # info levels: main=0.98, then 0.80 for all others
-            info_levels = ([0.98] + [0.80] * (n - 1))[:n]
+            if n == 1:
+                strengths   = [0.85]
+                info_levels = [0.80]
+            elif n == 2:
+                strengths   = [0.60, 0.35]   # sum = 0.95
+                info_levels = [0.80, 0.70]
+            elif n == 3:
+                strengths   = [0.50, 0.28, 0.17]  # sum = 0.95
+                info_levels = [0.80, 0.70, 0.70]
+            else:  # 4
+                strengths   = [0.45, 0.25, 0.15, 0.10]  # sum = 0.95
+                info_levels = [0.80, 0.70, 0.70, 0.70]
             params["reference_image_multiple"] = [
                 base64.b64encode(img).decode("utf-8") for img in reference_images
             ]
             params["reference_strength_multiple"]             = strengths
             params["reference_information_extracted_multiple"] = info_levels
+            logger.info(f"Vibe refs: {n} images, strengths={strengths} (sum={sum(strengths):.2f})")
 
         payload = {
             "input":      input_str,
@@ -1888,14 +1948,15 @@ async def _generate_image_adult(
                 headers={
                     "authorization": f"Bearer {NOVELAI_API_KEY}",
                     "content-type":  "application/json",
-                    "accept":        "application/zip",
+                    "accept":        "application/x-msgpack",
                 },
                 json=payload,
             )
 
         if response.status_code == 500 and reference_images:
-            # 500 with vibe refs: retry once without them
-            logger.warning(f"NAI 500 with vibe refs [{label}] — retrying without references")
+            # Log the actual error body so we can diagnose future issues
+            logger.error(f"NAI 500 with vibe refs [{label}] body: {response.text[:500]}")
+            logger.warning(f"Retrying without vibe references")
             params.pop("reference_image_multiple", None)
             params.pop("reference_strength_multiple", None)
             params.pop("reference_information_extracted_multiple", None)
@@ -1906,14 +1967,15 @@ async def _generate_image_adult(
                     headers={
                         "authorization": f"Bearer {NOVELAI_API_KEY}",
                         "content-type":  "application/json",
-                        "accept":        "application/zip",
+                        "accept":        "application/x-msgpack",
                     },
                     json=payload,
                 )
 
         if response.status_code == 500:
-            # Still 500 — simplify to plain text prompt with no char_captions structure
-            logger.warning(f"NAI 500 [{label}] — retrying with simplified plain prompt")
+            # Still 500 — log body and simplify to plain prompt with no char_captions
+            logger.error(f"NAI 500 without refs [{label}] body: {response.text[:500]}")
+            logger.warning(f"Retrying with simplified plain prompt")
             params["v4_prompt"] = {
                 "caption": {
                     "base_caption": input_str,
@@ -1937,7 +1999,7 @@ async def _generate_image_adult(
                     headers={
                         "authorization": f"Bearer {NOVELAI_API_KEY}",
                         "content-type":  "application/json",
-                        "accept":        "application/zip",
+                        "accept":        "application/x-msgpack",
                     },
                     json=payload,
                 )
@@ -1947,9 +2009,19 @@ async def _generate_image_adult(
             logger.error(f"NovelAI API error {response.status_code}: {msg}")
             return None, f"⚠️ NovelAI API error {response.status_code}: {msg}"
 
-        import zipfile
-        with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
-            image_bytes = zf.read(zf.namelist()[0])
+        # Try msgpack parsing first (V4.5 native format), fall back to ZIP
+        image_bytes = _parse_novelai_msgpack(response.content)
+        if image_bytes is None:
+            # Fallback: try ZIP (some V4.5 configurations still return ZIP)
+            try:
+                import zipfile
+                with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
+                    image_bytes = zf.read(zf.namelist()[0])
+                logger.info(f"Parsed response as ZIP [{label}]")
+            except Exception:
+                pass
+        if image_bytes is None:
+            return None, "⚠️ NovelAI: could not parse image from response."
         return image_bytes, None
 
     except Exception as e:
