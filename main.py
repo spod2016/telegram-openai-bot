@@ -2071,31 +2071,51 @@ async def _generate_image_adult(
 
         image_bytes = None
         parse_method = None
+        is_zip = raw[:4] == b"PK\x03\x04"
 
-        # 1. Try msgpack framed stream (V4/V4.5 native when accept=msgpack)
-        image_bytes = _parse_novelai_msgpack(raw)
-        if image_bytes:
-            parse_method = "msgpack"
-
-        # 2. Try ZIP (V3 format, still used by some V4.5 responses)
-        if image_bytes is None:
+        # 1. If ZIP magic bytes detected, try ZIP first — it's clearly a ZIP file
+        if is_zip:
             try:
                 import zipfile
                 with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-                    names = zf.namelist()
-                    if names:
-                        image_bytes = zf.read(names[0])
-                        parse_method = f"zip({names[0]})"
+                    image_names = [n for n in zf.namelist()
+                                   if n.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))]
+                    if not image_names:
+                        image_names = zf.namelist()
+                    if image_names:
+                        image_bytes = zf.read(image_names[0])
+                        parse_method = f"zip({image_names[0]})"
             except Exception:
                 pass
 
-        # 3. Try raw PNG scan (image embedded directly without framing)
+        # 2. Try msgpack framed stream (V4/V4.5 native when accept=msgpack)
+        if image_bytes is None:
+            image_bytes = _parse_novelai_msgpack(raw)
+            if image_bytes:
+                parse_method = "msgpack"
+
+        # 3. Try ZIP if we haven't yet (response wasn't ZIP magic but maybe still ZIP)
+        if image_bytes is None and not is_zip:
+            try:
+                import zipfile
+                with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                    image_names = [n for n in zf.namelist()
+                                   if n.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))]
+                    if not image_names:
+                        image_names = zf.namelist()
+                    if image_names:
+                        image_bytes = zf.read(image_names[0])
+                        parse_method = f"zip_fallback({image_names[0]})"
+            except Exception:
+                pass
+
+        # 4. Raw PNG/JPEG scan — image embedded directly without framing
         if image_bytes is None:
             image_bytes = _extract_image_raw(raw)
             if image_bytes:
                 parse_method = "raw_scan"
 
-        # 4. Try treating the entire response as a direct image
+        # 5. Last resort — treat entire response as the image
         if image_bytes is None and len(raw) > 100:
             image_bytes = raw
             parse_method = "raw_direct"
