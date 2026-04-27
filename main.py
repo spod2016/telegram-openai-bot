@@ -856,7 +856,7 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
         label=f"panel {panel_num} of game {token}",
         fallback_prompt=fallback,
         adult_mode=is_adult,
-        nai_seed=comic.get("nai_seed"),
+        nai_seed=None,   # random seed per panel — vibe transfer handles consistency
         nai_references=nai_refs if is_adult else None,
     )
 
