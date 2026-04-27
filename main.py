@@ -896,9 +896,7 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
         prompt = await _build_panel_prompt_adult(comic, scene_text)
 
         # Build per-character vibe references from the char_first_panel map.
-        # For each character appearing in this scene, look up their first-appearance image.
-        # Priority: main character first (origin), then others in order of introduction.
-        # Cap at 4 references to avoid diluting the signal.
+        # Skip panels flagged as vibe_unreliable (generated via simplified fallback).
         char_first_panel = comic.get("char_first_panel", {})
         present_tags     = prompt.get("present_chars", [])
 
@@ -911,7 +909,7 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
             nai_refs.append(origin)
             seen.add(id(origin))
 
-        # Additional characters in scene — their first-appearance image
+        # Additional characters in scene — their first reliable appearance image
         for tag_str in present_tags:
             ref = char_first_panel.get(tag_str)
             if ref and id(ref) not in seen and len(nai_refs) < 4:
@@ -984,18 +982,22 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
     # Clear retry flag on success (or non-policy failure)
     comic.pop("retry_player", None)
 
+    # Detect if simplified fallback was used (char_captions stripped)
+    vibe_unreliable = (image_error == "VIBE_UNRELIABLE")
+
     # Store panel
     comic["panels"].append({
-        "author_id":  chat_id,
-        "prompt":     scene_text,
-        "image_data": image_data,
-        "skipped":    False,
-        "nai_seed":   panel_seed,
+        "author_id":      chat_id,
+        "prompt":         scene_text,
+        "image_data":     image_data,
+        "skipped":        False,
+        "nai_seed":       panel_seed,
+        "vibe_unreliable": vibe_unreliable,
     })
 
-    # Update char_first_panel map: register the first image each character appears in.
-    # Characters already in the map keep their original first-appearance reference.
-    if is_adult and image_data and isinstance(prompt, dict):
+    # Update char_first_panel map — skip unreliable panels since they lack char_captions
+    # and would anchor inconsistent appearance for future panels.
+    if is_adult and image_data and isinstance(prompt, dict) and not vibe_unreliable:
         char_first_panel = comic.setdefault("char_first_panel", {})
         for tag_str in prompt.get("present_chars", []):
             if tag_str and tag_str not in char_first_panel:
@@ -1879,6 +1881,7 @@ async def _generate_image_adult(
     try:
         actual_seed = seed if seed is not None else random.randint(0, 2**32 - 1)
         neg         = _build_negative_prompt_adult()
+        simplified_fallback_used = False  # track if char_captions were stripped
 
         # Resolve input string and char_captions from prompt_data
         if isinstance(prompt_data, dict):
@@ -1903,7 +1906,7 @@ async def _generate_image_adult(
                     "base_caption": input_str,
                     "char_captions": char_captions,
                 },
-                "use_coords": False,
+                "use_coords": len(char_captions) > 1,  # activate placement for multi-char
                 "use_order":  len(char_captions) > 1,
             },
             "v4_negative_prompt": {
@@ -2015,6 +2018,12 @@ async def _generate_image_adult(
                     },
                     json=payload,
                 )
+            # Mark that this image was generated without char_captions —
+            # it will be excluded from vibe transfer references to prevent
+            # propagating inconsistency to subsequent panels.
+            if response.status_code == 200:
+                simplified_fallback_used = True
+                logger.warning(f"Panel generated via simplified fallback [{label}] — marking as vibe_unreliable")
 
         if response.status_code != 200:
             msg = response.text[:300]
@@ -2045,7 +2054,7 @@ async def _generate_image_adult(
             logger.error(f"NAI returned unparseable image bytes [{label}]: {val_err}")
             return None, f"⚠️ NovelAI returned invalid image data: {val_err}"
 
-        return image_bytes, None
+        return image_bytes, "VIBE_UNRELIABLE" if simplified_fallback_used else None
 
     except Exception as e:
         logger.error(f"NovelAI V4.5 image generation failed [{label}]: {e}")
