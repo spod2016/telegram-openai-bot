@@ -36,6 +36,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Persistent game analytics log
+# ---------------------------------------------------------------------------
+import json as _json
+
+GAME_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "game_log.jsonl")
+_game_log_lock = threading.Lock()
+
+def log_game_event(event: str, data: dict) -> None:
+    """Append a JSON line to the persistent game log. Thread-safe."""
+    record = {"event": event, "ts": datetime.utcnow().isoformat(), **data}
+    try:
+        with _game_log_lock:
+            with open(GAME_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(_json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        logger.warning(f"game_log write failed: {exc}")
+
+# ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
 games: dict = {}
@@ -227,6 +245,14 @@ async def _finalise_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         _join_game(games[token], token, chat_id, update.effective_user, context)
 
+        log_game_event("started", {
+            "token": token,
+            "mode": "solo",
+            "num_players": 1,
+            "style_name": style_name,
+            "adult_mode": is_adult,
+        })
+
         await update.message.reply_text(
             f"🎮 <b>Solo game started!</b>\n"
             f"🎨 Style: <b>{style_name}</b>\n\n"
@@ -255,6 +281,14 @@ async def _finalise_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "original_phrase": None,
         "adult_mode": is_adult,
     }
+
+    log_game_event("started", {
+        "token": token,
+        "mode": "multiplayer",
+        "num_players": n,
+        "style_name": style_name,
+        "adult_mode": is_adult,
+    })
 
     bot_username = context.bot.username
     deep_link    = f"https://t.me/{bot_username}?start={token}"
@@ -521,6 +555,16 @@ async def receive_solo_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
     game = games[token]
     game["finished"] = True
+
+    log_game_event("completed", {
+        "token": token,
+        "mode": "solo" if game.get("num_players") == 1 else "multiplayer",
+        "num_players": game.get("num_players", 1),
+        "style_name": game.get("style_name", ""),
+        "adult_mode": game.get("adult_mode", False),
+        "started_at": game["created_at"].isoformat() if isinstance(game.get("created_at"), datetime) else str(game.get("created_at")),
+        "actual_players": len(game.get("player_order", [])),
+    })
 
     ordered_answers = (
         game["solo_answers"]
