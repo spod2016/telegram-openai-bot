@@ -1939,70 +1939,80 @@ async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
     structured    = await _scene_to_nai_structured(scene_text, cast)
     scene_tags    = structured["scene_tags"]
     char_captions = structured["char_captions"]
+    cast_names    = {c["name"] for c in cast}
 
-    # Detect new characters: present_chars names that aren't in cast yet
-    # The scene parser returns char_captions from the cast — if it found
-    # a name it couldn't match, it would have used the main char tags as fallback.
-    # We detect this by comparing caption count vs cast matches.
-    # Better: re-check the raw present list against cast names.
-    cast_names = {c["name"] for c in cast}
+    # Only run new character detection if the scene parser returned MORE characters
+    # than are in the existing cast — i.e. it couldn't resolve all names to cast labels.
+    # If all present_chars were resolved to existing cast members, skip this step entirely.
+    # This prevents player-used proper names (like "Jack" = "partner") from being
+    # treated as brand-new characters by the secondary detection pass.
+    scene_char_count = len(char_captions)
+    if scene_char_count > len(cast):
+        # Scene parser found more characters than exist in cast — genuinely new
+        try:
+            client = AsyncOpenAI(
+                api_key=GROQ_API_KEY,
+                base_url="https://api.groq.com/openai/v1",
+            )
+            cast_summary = "\n".join(
+                f"  label='{c['name']}', appearance={c['tags']}" for c in cast
+            )
+            new_char_response = await client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                max_tokens=200,
+                temperature=0.2,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You identify genuinely new characters in scenes. Output JSON only.",
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"EXISTING CAST:\n{cast_summary}\n"
+                            f"SCENE: '{scene_text}'\n\n"
+                            f"List only characters who appear in this scene but CANNOT be matched "
+                            f"to any existing cast member by name, nickname, pronoun, or description. "
+                            f"If a name like 'Jack' could refer to an existing cast member, do NOT list it.\n"
+                            f"Return JSON array: [{{\"name\": \"label\", \"description\": \"brief description\"}}]\n"
+                            f"Return [] if uncertain. Raw JSON only."
+                        ),
+                    },
+                ],
+            )
+            raw = new_char_response.choices[0].message.content.strip()
+            if "```" in raw:
+                for part in raw.split("```"):
+                    part = part.strip().lstrip("json").strip()
+                    if part.startswith("["):
+                        raw = part
+                        break
+            import json
+            new_chars = json.loads(raw)
+            if isinstance(new_chars, list):
+                for nc in new_chars:
+                    if isinstance(nc, dict) and nc.get("name") and nc.get("description"):
+                        name = nc["name"].strip()
+                        if name not in cast_names:
+                            tags = await _generate_char_tags_nai(nc["description"])
+                            if tags:
+                                new_entry = {"name": name, "tags": tags}
+                                cast.append(new_entry)
+                                comic["nai_cast"] = cast
+                                cast_names.add(name)
+                                char_captions.append({"char_caption": tags})
+                                centers = _distributed_centers(len(char_captions))
+                                for i, cap in enumerate(char_captions):
+                                    cap["centers"] = centers[i]
+                                logger.info(f"New character added to cast: '{name}' — {tags}")
+        except Exception as e:
+            logger.warning(f"New character detection failed: {e}")
+    else:
+        logger.info(f"Skipping new char detection — scene parser resolved all {scene_char_count} chars to existing cast")
 
-    # Ask Groq to identify any new characters mentioned but not in cast
-    try:
-        client = AsyncOpenAI(
-            api_key=GROQ_API_KEY,
-            base_url="https://api.groq.com/openai/v1",
-        )
-        new_char_response = await client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            max_tokens=200,
-            temperature=0.2,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You identify new characters in scenes. Output JSON only.",
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"EXISTING CAST: {', '.join(cast_names)}\n"
-                        f"SCENE: '{scene_text}'\n\n"
-                        f"List any characters who appear in this scene but are NOT in the existing cast. "
-                        f"For each, give a short name and a brief description.\n"
-                        f"Return JSON array: [{{\"name\": \"label\", \"description\": \"brief description\"}}]\n"
-                        f"Return [] if no new characters. Raw JSON only."
-                    ),
-                },
-            ],
-        )
-        raw = new_char_response.choices[0].message.content.strip()
-        if "```" in raw:
-            for part in raw.split("```"):
-                part = part.strip().lstrip("json").strip()
-                if part.startswith("["):
-                    raw = part
-                    break
-        import json
-        new_chars = json.loads(raw)
-        if isinstance(new_chars, list):
-            for nc in new_chars:
-                if isinstance(nc, dict) and nc.get("name") and nc.get("description"):
-                    name = nc["name"].strip()
-                    if name not in cast_names:
-                        tags = await _generate_char_tags_nai(nc["description"])
-                        if tags:
-                            new_entry = {"name": name, "tags": tags}
-                            cast.append(new_entry)
-                            comic["nai_cast"] = cast
-                            cast_names.add(name)
-                            char_captions.append({"char_caption": tags})
-                            # Redistribute centers for all chars including the new one
-                            centers = _distributed_centers(len(char_captions))
-                            for i, cap in enumerate(char_captions):
-                                cap["centers"] = centers[i]
-                            logger.info(f"New character added to cast: '{name}' — {tags}")
-    except Exception as e:
-        logger.warning(f"New character detection failed: {e}")
+    # Log the final char_captions being sent to NAI for debugging
+    for i, cap in enumerate(char_captions):
+        logger.info(f"NAI char_caption[{i}]: {cap.get('char_caption', '')[:100]}")
 
     return {
         "input":         f"{_char_count_prefix(char_captions)}{quality_tags}, {scene_tags}",
@@ -2136,6 +2146,17 @@ async def _generate_image_adult(
             "action":     "generate",
             "parameters": params,
         }
+
+        # Log full char_captions and key params for diagnosing 500s
+        logger.info(
+            f"NAI request [{label}] — "
+            f"input: '{input_str[:80]}' | "
+            f"char_captions: {len(char_captions)} | "
+            f"seed: {actual_seed} | "
+            f"refs: {len(reference_images) if reference_images else 0}"
+        )
+        for i, cap in enumerate(char_captions):
+            logger.info(f"  char[{i}]: {str(cap)[:120]}")
 
         async with httpx.AsyncClient(timeout=120) as client:
             response = await client.post(
