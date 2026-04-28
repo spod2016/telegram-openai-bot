@@ -1780,8 +1780,11 @@ async def _scene_to_nai_structured(scene_text: str, cast: list[dict]) -> dict:
     where char_captions contains ONLY characters who actually appear in this scene,
     pulled from their established cast bible tags."""
     main_char_tags = cast[0]["tags"] if cast else ""
+    # Include both the cast label and a short description derived from tags
+    # so Groq can resolve player-used proper names back to cast labels.
     cast_summary   = "\n".join(
-        f"  - {c['name']}: {c['tags']}" for c in cast
+        f"  - label='{c['name']}', appearance={c['tags']}"
+        for c in cast
     )
     try:
         client = AsyncOpenAI(
@@ -1803,26 +1806,32 @@ async def _scene_to_nai_structured(scene_text: str, cast: list[dict]) -> dict:
                 {
                     "role": "user",
                     "content": (
-                        f"ESTABLISHED CAST (use EXACTLY these tags, do not invent new appearance):\n"
+                        f"ESTABLISHED CAST (use EXACTLY these name labels and tags):\n"
                         f"{cast_summary}\n\n"
                         f"SCENE TO ILLUSTRATE: '{scene_text}'\n\n"
+                        f"IMPORTANT — ALIAS RESOLUTION: Players may refer to cast members by "
+                        f"different names, nicknames, or pronouns. Before identifying who is present, "
+                        f"resolve any name or pronoun in the scene to the closest matching cast label. "
+                        f"For example if the cast has 'partner' described as 'Jack' and the scene "
+                        f"mentions 'Jack', that maps to 'partner' — do NOT create a new character.\n"
+                        f"Only create a new entry in present_chars if the scene clearly introduces "
+                        f"a person who cannot be matched to any existing cast member.\n\n"
                         f"Output a JSON object with exactly two keys:\n\n"
                         f"1. 'scene_tags': comma-separated Danbooru tags for the setting, action, "
                         f"poses, lighting, mood, explicit sexual acts or states. "
                         f"NEVER put character appearance here — only environment and action.\n\n"
-                        f"2. 'present_chars': JSON array of character names from the cast who "
-                        f"actually appear in this scene. Use the exact name labels from the cast. "
-                        f"ALWAYS include 'main'. Add others only if the scene explicitly involves them. "
-                        f"The array length determines how many characters appear in the image — "
-                        f"be precise. Include ALL characters the scene describes.\n\n"
+                        f"2. 'present_chars': JSON array of cast name labels who appear in this scene. "
+                        f"Use the exact labels from the cast above. ALWAYS include 'main'. "
+                        f"Add others only if the scene explicitly involves them. "
+                        f"Be precise — the array length determines how many characters appear in the image.\n\n"
                         f"EXAMPLES:\n"
-                        f"Scene: 'she undresses alone in the bedroom' → "
+                        f"Cast: main=Sam, partner=Jack. Scene: 'Jack joins Sam on the sofa' → "
+                        f"{{\"scene_tags\": \"living room, sofa, sitting together, evening, intimate\", "
+                        f"\"present_chars\": [\"main\", \"partner\"]}}\n"
+                        f"Cast: main=girl, teacher=Mr Brown. Scene: 'she undresses alone' → "
                         f"{{\"scene_tags\": \"bedroom, undressing, standing, dim light, seductive\", "
                         f"\"present_chars\": [\"main\"]}}\n"
-                        f"Scene: 'the teacher joins her on the sofa' → "
-                        f"{{\"scene_tags\": \"living room, sofa, sitting together, evening, intimate\", "
-                        f"\"present_chars\": [\"main\", \"teacher\"]}}\n"
-                        f"Scene: 'all three of them in the hot spring' → "
+                        f"Cast: main, friend, stranger. Scene: 'all three in the hot spring' → "
                         f"{{\"scene_tags\": \"outdoor onsen, steam, night, group, relaxing, nude\", "
                         f"\"present_chars\": [\"main\", \"friend\", \"stranger\"]}}\n\n"
                         f"Output raw JSON only. No markdown. No explanation."
@@ -2095,12 +2104,31 @@ async def _generate_image_adult(
             else:  # 4
                 strengths   = [0.45, 0.25, 0.15, 0.10]  # sum = 0.95
                 info_levels = [0.80, 0.70, 0.70, 0.70]
+
+            # Compress refs to 512×512 JPEG before base64-encoding.
+            # Full 1024×1024 images (~2.2MB) make the JSON payload ~6MB+ with 2 refs,
+            # which exceeds NAI's payload limit and causes 500 errors.
+            # At 512×512 JPEG q=85 each ref is ~150KB — well within limits.
+            compressed_refs = []
+            for img_bytes in reference_images:
+                try:
+                    from PIL import Image as PilImage
+                    pil = PilImage.open(io.BytesIO(img_bytes)).convert("RGB")
+                    pil = pil.resize((512, 512), PilImage.LANCZOS)
+                    buf = io.BytesIO()
+                    pil.save(buf, format="JPEG", quality=85)
+                    compressed_refs.append(buf.getvalue())
+                    logger.info(f"Vibe ref compressed: {len(img_bytes)//1024}KB → {buf.tell()//1024}KB")
+                except Exception as e:
+                    logger.warning(f"Failed to compress vibe ref: {e} — using original")
+                    compressed_refs.append(img_bytes)
+
             params["reference_image_multiple"] = [
-                base64.b64encode(img).decode("utf-8") for img in reference_images
+                base64.b64encode(img).decode("utf-8") for img in compressed_refs
             ]
             params["reference_strength_multiple"]             = strengths
             params["reference_information_extracted_multiple"] = info_levels
-            logger.info(f"Vibe refs: {n} images, strengths={strengths} (sum={sum(strengths):.2f})")
+            logger.info(f"Vibe refs: {n} images at 512px, strengths={strengths} (sum={sum(strengths):.2f})")
 
         payload = {
             "input":      input_str,
