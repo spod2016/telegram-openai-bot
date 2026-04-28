@@ -1296,6 +1296,105 @@ async def compile_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
 # Comic strip compositor
 # ---------------------------------------------------------------------------
 
+def _build_solo_strip(
+    initial_image_data: bytes | None,
+    panels: list[dict],
+    original_phrase: str,
+) -> bytes | None:
+    """2×2 grid layout for solo games:
+    ┌─────────┬─────────┐
+    │ Origin  │ Panel 1 │
+    │ caption │ caption │
+    ├─────────┼─────────┤
+    │ Panel 2 │ Panel 3 │
+    │ caption │ caption │
+    └─────────┴─────────┘
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return None
+
+    try:
+        CELL      = 512
+        PAD       = 8
+        BG        = (18, 18, 26)
+        CAPTION_BG= (32, 32, 46)
+        BORDER    = (70, 55, 110)
+        C_LABEL   = (180, 140, 255)
+        C_TEXT    = (210, 210, 210)
+
+        font_bold, _, font_small = _load_fonts()
+
+        # Collect all 4 slots first so we can compute dynamic caption height
+        real_panels = [p for p in panels if not p.get("skipped") and p.get("image_data")]
+        slots = [
+            {"image_data": initial_image_data, "prompt": original_phrase, "num": "1."},
+        ] + [
+            {"image_data": p["image_data"], "prompt": p["prompt"], "num": f"{i+2}."}
+            for i, p in enumerate(real_panels[:3])
+        ]
+
+        # Dynamic caption height — fit the longest prompt across all slots
+        chars_per_line = max(10, (CELL - 34) // 8)
+        max_lines = max(
+            len(textwrap.wrap(s["prompt"], width=chars_per_line)) or 1
+            for s in slots
+        )
+        CAPTION_H = 20 + max_lines * STRIP_LINE_H + 8  # label row + text + padding
+
+        canvas_w = 2 * CELL + 3 * PAD
+        canvas_h = 2 * (CELL + CAPTION_H) + 3 * PAD
+        canvas   = Image.new("RGB", (canvas_w, canvas_h), BG)
+        draw     = ImageDraw.Draw(canvas)
+
+        positions = [
+            (PAD,        PAD),
+            (PAD*2+CELL, PAD),
+            (PAD,        PAD*2 + CELL + CAPTION_H),
+            (PAD*2+CELL, PAD*2 + CELL + CAPTION_H),
+        ]
+
+        for i, (px, py) in enumerate(positions):
+            slot = slots[i] if i < len(slots) else None
+
+            # Image cell
+            img_data = slot["image_data"] if slot else None
+            if img_data:
+                try:
+                    img = Image.open(io.BytesIO(img_data)).convert("RGB")
+                    img = img.resize((CELL, CELL), Image.LANCZOS)
+                except Exception:
+                    img = Image.new("RGB", (CELL, CELL), (50, 50, 60))
+            else:
+                img = Image.new("RGB", (CELL, CELL), (30, 30, 40))
+
+            canvas.paste(img, (px, py))
+            draw.rectangle(
+                [px - 2, py - 2, px + CELL + 1, py + CELL + 1],
+                outline=BORDER, width=2,
+            )
+
+            # Caption strip — all lines, no truncation
+            cy = py + CELL
+            draw.rectangle([px, cy, px + CELL, cy + CAPTION_H], fill=CAPTION_BG)
+            if slot:
+                draw.text((px + 8, cy + 5), slot["num"], font=font_bold, fill=C_LABEL)
+                lines = textwrap.wrap(slot["prompt"], width=chars_per_line)
+                for li, line in enumerate(lines):
+                    draw.text((px + 26, cy + 5 + li * STRIP_LINE_H),
+                              line, font=font_small, fill=C_TEXT)
+
+        buf = io.BytesIO()
+        canvas.save(buf, format="JPEG", quality=92)
+        logger.info(f"Solo strip built: {canvas_w}×{canvas_h}px")
+        return buf.getvalue()
+
+    except Exception as e:
+        logger.error(f"_build_solo_strip failed: {e}", exc_info=True)
+        return None
+
+
 def _build_comic_strip(
     initial_image_data: bytes | None,
     panels: list[dict],
@@ -1326,6 +1425,11 @@ def _build_comic_strip(
         return None
 
     try:
+        # ── Solo mode: strict 2×2 grid (origin TL, panel1 TR, panel2 BL, panel3 BR) ──
+        if num_players == 1:
+            return _build_solo_strip(
+                initial_image_data, panels, original_phrase
+            )
         # ── Design constants ────────────────────────────────────────────────
         COLS        = num_players          # columns = players (each row = 1 round)
         PANEL_SIZE  = _panel_size(COLS)    # adaptive square panel size
