@@ -138,6 +138,24 @@ def display_name_for(user) -> str:
     return name
 
 
+async def _shorten_url(url: str) -> str:
+    """Shorten a URL using is.gd. Returns original URL on failure."""
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=5) as client:
+            response = await client.get(
+                "https://is.gd/create.php",
+                params={"format": "simple", "url": url},
+            )
+        if response.status_code == 200 and response.text.strip().startswith("https://"):
+            short = response.text.strip()
+            logger.info(f"Shortened {url} → {short}")
+            return short
+    except Exception as e:
+        logger.warning(f"URL shortening failed: {e}")
+    return url
+
+
 # ---------------------------------------------------------------------------
 # /create flow
 # ---------------------------------------------------------------------------
@@ -165,14 +183,8 @@ async def create_game_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def receive_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
-    if not text.isdigit() or not (1 <= int(text) <= 11):
-        await update.message.reply_text("❌ Please reply with a number between 1 and 11.")
-        return WAITING_FOR_STYLE
-
-    choice = int(text)
-
-    # Adult mode selected — ask host for age confirmation first
-    if choice == 11:
+    # Secret passphrase triggers adult mode — not shown in the menu
+    if text.lower() == "hellokitty":
         if not NOVELAI_API_KEY:
             await update.message.reply_text(
                 "⚠️ Adult mode is not configured on this server. "
@@ -189,8 +201,12 @@ async def receive_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_FOR_AGE_CONFIRM
 
+    if not text.isdigit() or not (1 <= int(text) <= 10):
+        await update.message.reply_text("❌ Please reply with a number between 1 and 10.")
+        return WAITING_FOR_STYLE
+
     # Standard style
-    context.user_data["pending_style_choice"] = choice
+    context.user_data["pending_style_choice"] = int(text)
     return await _finalise_style(update, context)
 
 
@@ -295,15 +311,16 @@ async def _finalise_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     bot_username = context.bot.username
     deep_link    = f"https://t.me/{bot_username}?start={token}"
+    short_link   = await _shorten_url(deep_link)
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(
             text="📤 Share game invite",
-            url=f"https://t.me/share/url?text=Let%27s%20make%20a%20comic%20together%21%20Join%20my%20Skazk.AI%20game%20%E2%80%94%20takes%20just%20minutes%2C%20guaranteed%20to%20be%20ridiculous%20%F0%9F%91%87&url={deep_link}",
+            url=f"https://t.me/share/url?text=Let%27s%20make%20a%20comic%20together%21%20Join%20my%20Skazk.AI%20game%20%E2%80%94%20takes%20just%20minutes%2C%20guaranteed%20to%20be%20ridiculous&url={short_link}",
         )],
         [InlineKeyboardButton(
             text="▶️ Join this game yourself",
-            url=deep_link,
+            url=short_link,
         )],
     ])
 
@@ -890,7 +907,7 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
     panel_num  = comic["current_turn_index"] + 1
     is_retry   = comic.get("retry_player") == chat_id  # True if this is their second attempt
 
-    await update.message.reply_text(f"✅ Got it! Generating panel {panel_num}… 🎨 (this takes ~15 seconds)")
+    await update.message.reply_text(f"✅ Got it! Generating panel {panel_num}… 🎨")
 
     # Generate panel image — use NAI-optimised prompt and fixed seed for adult mode
     is_adult = comic.get("adult_mode", False)
