@@ -2115,10 +2115,10 @@ async def _generate_image_adult(
                 strengths   = [0.45, 0.25, 0.15, 0.10]  # sum = 0.95
                 info_levels = [0.80, 0.70, 0.70, 0.70]
 
-            # Compress refs to 512×512 JPEG before base64-encoding.
-            # Full 1024×1024 images (~2.2MB) make the JSON payload ~6MB+ with 2 refs,
-            # which exceeds NAI's payload limit and causes 500 errors.
-            # At 512×512 JPEG q=85 each ref is ~150KB — well within limits.
+            # Compress refs to 512×512 PNG before base64-encoding.
+            # NAI generates PNG images and vibe transfer expects PNG input —
+            # JPEG caused instant 500 rejections at the server level.
+            # 512×512 PNG is ~300–500KB, well within payload limits.
             compressed_refs = []
             for img_bytes in reference_images:
                 try:
@@ -2126,9 +2126,9 @@ async def _generate_image_adult(
                     pil = PilImage.open(io.BytesIO(img_bytes)).convert("RGB")
                     pil = pil.resize((512, 512), PilImage.LANCZOS)
                     buf = io.BytesIO()
-                    pil.save(buf, format="JPEG", quality=85)
+                    pil.save(buf, format="PNG", optimize=True)
                     compressed_refs.append(buf.getvalue())
-                    logger.info(f"Vibe ref compressed: {len(img_bytes)//1024}KB → {buf.tell()//1024}KB")
+                    logger.info(f"Vibe ref compressed: {len(img_bytes)//1024}KB → {buf.tell()//1024}KB (PNG)")
                 except Exception as e:
                     logger.warning(f"Failed to compress vibe ref: {e} — using original")
                     compressed_refs.append(img_bytes)
