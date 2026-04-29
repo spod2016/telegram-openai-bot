@@ -2849,6 +2849,7 @@ def main():
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,  # /create always starts fresh even if stuck mid-conversation
         per_user=True,
         per_chat=True,
     )
@@ -2868,6 +2869,7 @@ def main():
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,  # /play or /start always re-enters even if stuck
         per_user=True,
         per_chat=True,
     )
@@ -2897,8 +2899,8 @@ def main():
                     chat_id=update.effective_chat.id,
                     text=(
                         "⚠️ <b>An unexpected error occurred.</b>\n\n"
-                        "This is usually a temporary network issue. "
-                        "Please try again or start a new game with /create."
+                        "This is usually a temporary network issue.\n\n"
+                        "Type /cancel to reset, then /create to start a new game."
                     ),
                     parse_mode="HTML",
                 )
