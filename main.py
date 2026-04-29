@@ -350,17 +350,20 @@ async def _finalise_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
     })
 
     bot_username = context.bot.username
-    deep_link    = f"https://t.me/{bot_username}?start={token}"
-    short_link   = await _shorten_url(deep_link)
+    deep_link = f"https://t.me/{bot_username}?start={token}"
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(
             text="📤 Share game invite",
-            url=f"https://t.me/share/url?text=Let%27s%20make%20a%20comic%20together%21%20Join%20my%20Skazk.AI%20game%20%E2%80%94%20takes%20just%20minutes%2C%20guaranteed%20to%20be%20ridiculous&url={short_link}",
+            url=f"https://t.me/share/url?text=Let%27s%20make%20a%20comic%20together%21%20Join%20my%20Skazk.AI%20game%20%E2%80%94%20takes%20just%20minutes%2C%20guaranteed%20to%20be%20ridiculous&url={deep_link}",
+        )],
+        [InlineKeyboardButton(
+            text="🔗 Copy invite link",
+            url=deep_link,
         )],
         [InlineKeyboardButton(
             text="▶️ Join this game yourself",
-            url=short_link,
+            url=deep_link,
         )],
     ])
 
