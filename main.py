@@ -1973,7 +1973,7 @@ async def _scene_to_nai_structured(
         )
         response = await client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            max_tokens=400,
+            max_tokens=600,
             temperature=0.2,
             messages=[
                 {
@@ -1998,18 +1998,25 @@ async def _scene_to_nai_structured(
                         + f"CURRENT SCENE TO ILLUSTRATE: '{scene_text}'\n\n"
                         f"ALIAS RESOLUTION: Resolve any name/pronoun to the closest matching cast label. "
                         f"Only add a new entry in present_chars if genuinely not matchable.\n\n"
-                        f"Output a JSON object with exactly two keys:\n\n"
-                        f"1. 'scene_tags': Danbooru tags for setting, action, poses, lighting, mood, explicit acts. "
+                        f"Output a JSON object with exactly THREE keys:\n\n"
+                        f"1. 'scene_tags': Danbooru tags for setting, lighting, mood, explicit acts. "
                         f"If scene doesn't mention a location, carry forward the established setting. "
-                        f"NEVER put character appearance here.\n\n"
+                        f"NEVER put character appearance or per-character actions here.\n\n"
                         f"2. 'present_chars': JSON array of cast name labels present in this scene. "
-                        f"ALWAYS include 'main' if main character is involved. "
                         f"Be precise — array length = number of characters in image.\n\n"
+                        f"3. 'char_actions': JSON object mapping each present character name to 2-4 "
+                        f"Danbooru pose/action tags describing WHAT THEY ARE DOING in this scene. "
+                        f"These are appended to their char_caption so NAI knows exactly who does what. "
+                        f"Focus on body position, role, and action — NOT appearance (no hair/eye color here).\n\n"
                         f"EXAMPLES:\n"
-                        f"Cast: Tom=1boy, Maria=1girl. Prev: Sergio. Scene: 'his cock is delicious, Maria loves to lick it' → "
-                        f"{{\"scene_tags\": \"oral sex, licking, nude, explicit\", "
-                        f"\"present_chars\": [\"Maria\", \"Sergio\"]}}\n"
-                        f"Setting: nudist beach. Scene: 'he watches from a distance' → include 'nudist beach, outdoor' in scene_tags.\n\n"
+                        f"Scene: 'Tom fucks Maria from behind while she moans' → "
+                        f"{{\"scene_tags\": \"doggystyle, explicit, nude, office\", "
+                        f"\"present_chars\": [\"Tom\", \"Maria\"], "
+                        f"\"char_actions\": {{\"Tom\": \"thrusting, dominant, standing\", \"Maria\": \"bent over, receiving, moaning\"}}}}\n"
+                        f"Scene: 'Sergio grabs her breast while Maria is fucked by Tom' → "
+                        f"{{\"scene_tags\": \"threesome, breast grab, intercourse, explicit\", "
+                        f"\"present_chars\": [\"Sergio\", \"Maria\", \"Tom\"], "
+                        f"\"char_actions\": {{\"Sergio\": \"groping, kissing\", \"Maria\": \"being penetrated, being groped\", \"Tom\": \"thrusting, penetrating\"}}}}\n\n"
                         f"Output raw JSON only. No markdown. No explanation."
                     ),
                 },
@@ -2023,33 +2030,63 @@ async def _scene_to_nai_structured(
                     raw = part
                     break
         import json
-        parsed      = json.loads(raw)
-        scene_tags  = parsed.get("scene_tags", "")
-        present     = parsed.get("present_chars", ["main"])
+        parsed       = json.loads(raw)
+        scene_tags   = parsed.get("scene_tags", "")
+        present      = parsed.get("present_chars", ["main"])
+        char_actions = parsed.get("char_actions", {})  # Fix 1: per-char pose tags
 
         if not isinstance(scene_tags, str) or not scene_tags.strip():
             scene_tags = scene_text[:200]
         if not isinstance(present, list) or not present:
             present = ["main"]
+        if not isinstance(char_actions, dict):
+            char_actions = {}
 
-        # Build char_captions from cast bible using matched names.
-        # Build char_captions from cast bible using matched names.
-        # IMPORTANT: skip names not found in cast — do NOT fall back to cast[0] which
-        # creates duplicate characters. Unknown names are handled by new char detection.
-        cast_by_name = {c["name"]: c["tags"] for c in cast}
+        # Fix 4: detect nudity and update cast tags dynamically
+        scene_lower = scene_text.lower()
+        is_scene_nude = any(w in scene_lower for w in
+                            ("naked", "nude", "undressed", "strips", "no clothes",
+                             "fully naked", "takes off", "removes"))
+        for c in cast:
+            if "1other" not in c["tags"] and is_scene_nude:
+                new_tags = ", ".join(
+                    t.strip() for t in c["tags"].split(",")
+                    if t.strip() not in ("casual clothes", "blouse", "shirt", "dress",
+                                         "suit", "jeans", "underwear", "bra", "pants",
+                                         "skirt", "top", "clothed", "outfit", "clothes")
+                )
+                if "nude" not in new_tags and "naked" not in new_tags:
+                    new_tags = new_tags.rstrip(", ") + ", nude"
+                if new_tags != c["tags"]:
+                    logger.info(f"Fix4: '{c['name']}' clothing updated → '{new_tags}'")
+                    c["tags"] = new_tags
+
+        # Fix 2: order present by first mention in scene_text for use_order alignment
+        def _mention_pos(name: str) -> int:
+            idx = scene_text.lower().find(name.lower())
+            return idx if idx >= 0 else 9999
+
+        present_ordered = sorted(present, key=_mention_pos)
+
+        # Build char_captions with name prefix (Fix 3), action tags (Fix 1),
+        # in narrative order (Fix 2), skipping unknown cast members.
+        cast_by_name  = {c["name"]: c["tags"] for c in cast}
         char_captions = []
         other_tags_for_scene = []
-        for name in present:
+        for name in present_ordered:
             tags = cast_by_name.get(name)
             if tags is None:
-                logger.info(f"Scene parser: '{name}' not in cast — skipping (new char detection will handle)")
+                logger.info(f"Scene parser: '{name}' not in cast — skipping")
                 continue
             if "1other" in tags:
-                # Only add entity name to scene_tags — no appearance descriptors
                 other_tags_for_scene.append(name.lower())
-                logger.info(f"1other '{name}' added to scene_tags as '{name.lower()}'")
+                logger.info(f"1other '{name}' → scene_tags as '{name.lower()}'")
             else:
-                char_captions.append({"char_caption": tags})
+                action  = char_actions.get(name, "")
+                caption = f"{name}, {tags}"          # Fix 3: name as anchor
+                if action:
+                    caption = caption.rstrip(", ") + f", {action}"  # Fix 1: pose tags
+                char_captions.append({"char_caption": caption})
 
         # Append 1other entity names to scene tags
         if other_tags_for_scene:
@@ -2057,20 +2094,22 @@ async def _scene_to_nai_structured(
 
         # Guarantee at least the main character
         if not char_captions and main_char_tags and "1other" not in main_char_tags:
-            char_captions = [{"char_caption": main_char_tags}]
+            main_name = cast[0]["name"] if cast else "main"
+            char_captions = [{"char_caption": f"{main_name}, {main_char_tags}"}]
 
-        # Distribute centers across canvas to prevent character merging
+        # Distribute centers across canvas
         centers = _distributed_centers(len(char_captions))
         for i, cap in enumerate(char_captions):
             cap["centers"] = centers[i]
 
         logger.info(f"Scene parsed — tags: '{scene_tags[:80]}' | "
-                    f"chars: {present} ({len(char_captions)} human captions)")
+                    f"chars: {present_ordered} ({len(char_captions)} human captions)")
         _dbg(debug_log, "SCENE_PARSER_INPUT",
              f"scene='{scene_text[:200]}' | cast={[c['name'] for c in cast]}")
         _dbg(debug_log, "SCENE_PARSER_RESULT",
-             f"scene_tags='{scene_tags}'\npresent={present}\n"
-             + "\n".join(f"  char[{i}]: {c.get('char_caption','')[:80]}" for i, c in enumerate(char_captions)))
+             f"scene_tags='{scene_tags}'\npresent_ordered={present_ordered}\n"
+             f"char_actions={char_actions}\n"
+             + "\n".join(f"  char[{i}]: {c.get('char_caption','')[:100]}" for i, c in enumerate(char_captions)))
         return {"scene_tags": scene_tags, "char_captions": char_captions}
 
     except Exception as e:
