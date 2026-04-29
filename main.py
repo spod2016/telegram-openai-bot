@@ -2026,14 +2026,12 @@ async def _scene_to_nai_structured(scene_text: str, cast: list[dict], debug_log:
             tags = cast_by_name.get(name, cast[0]["tags"] if cast else "")
             if tags:
                 if "1other" in tags:
-                    # Extract meaningful scene descriptors from the 1other tags
-                    other_descriptors = ", ".join(
-                        t.strip() for t in tags.split(",")
-                        if t.strip() not in ("1other",)
-                    )
-                    if other_descriptors:
-                        other_tags_for_scene.append(other_descriptors)
-                    logger.info(f"1other '{name}' moved to scene_tags: {other_descriptors}")
+                    # Fix: only add the entity NAME to scene_tags (e.g. "shark"),
+                    # NOT physical appearance tags like "grey scales, sharp teeth"
+                    # which bleed into human character rendering via base_caption.
+                    entity_name = name.lower()
+                    other_tags_for_scene.append(entity_name)
+                    logger.info(f"1other '{name}' added to scene_tags as: '{entity_name}' (appearance tags omitted)")
                 else:
                     char_captions.append({"char_caption": tags})
 
