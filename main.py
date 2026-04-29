@@ -138,6 +138,19 @@ def display_name_for(user) -> str:
     return name
 
 
+def _dbg(debug_log: list | None, step: str, data: str) -> None:
+    """Append a debug entry if debug_log is active."""
+    if debug_log is None:
+        return
+    import time
+    debug_log.append({
+        "ts":   time.strftime("%H:%M:%S", time.gmtime()),
+        "step": step,
+        "data": data,
+    })
+    logger.debug(f"[DBG] {step}: {data[:120]}")
+
+
 async def _shorten_url(url: str) -> str:
     """Shorten a URL using is.gd. Returns original URL on failure."""
     try:
@@ -183,6 +196,26 @@ async def create_game_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def receive_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
+    # Secret passphrase triggers adult debug mode
+    if text.lower() == "ddd":
+        if not NOVELAI_API_KEY:
+            await update.message.reply_text(
+                "⚠️ Adult mode is not configured on this server. "
+                "Please choose a style from 1–10."
+            )
+            return WAITING_FOR_STYLE
+        context.user_data["pending_style_choice"] = 11
+        context.user_data["pending_debug_mode"]   = True
+        await update.message.reply_text(
+            "🔞🐛 <b>Adult Debug mode selected.</b>\n\n"
+            "All prompts, Groq responses, and NAI payloads will be captured "
+            "and sent to you as a report at the end of the game.\n\n"
+            "⚠️ You must be 18 or older to proceed.\n\n"
+            "Are you 18+? Reply <b>YES</b> to confirm or <b>NO</b> to go back.",
+            parse_mode="HTML",
+        )
+        return WAITING_FOR_AGE_CONFIRM
+
     # Secret passphrase triggers adult mode — not shown in the menu
     if text.lower() == "hellokitty":
         if not NOVELAI_API_KEY:
@@ -192,6 +225,7 @@ async def receive_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return WAITING_FOR_STYLE
         context.user_data["pending_style_choice"] = 11
+        context.user_data["pending_debug_mode"]   = False
         await update.message.reply_text(
             "🔞 <b>Adult mode selected.</b>\n\n"
             "This mode generates explicit content using an external AI model.\n\n"
@@ -207,6 +241,7 @@ async def receive_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Standard style
     context.user_data["pending_style_choice"] = int(text)
+    context.user_data["pending_debug_mode"]   = False
     return await _finalise_style(update, context)
 
 
@@ -232,6 +267,7 @@ async def _finalise_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
     choice   = context.user_data.get("pending_style_choice", 1)
     n        = context.user_data["pending_num_players"]
     is_adult = (choice == 11)
+    is_debug = context.user_data.get("pending_debug_mode", False) and is_adult
 
     if is_adult:
         style_name   = ADULT_STYLE[0]
@@ -260,6 +296,8 @@ async def _finalise_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "original_phrase": None,
             "solo_answers": [],
             "adult_mode": is_adult,
+            "debug_mode":  is_debug,
+            "debug_log":   [] if is_debug else None,
         }
 
         _join_game(games[token], token, chat_id, update.effective_user, context)
@@ -299,6 +337,8 @@ async def _finalise_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "style_name": style_name,
         "original_phrase": None,
         "adult_mode": is_adult,
+        "debug_mode":  is_debug,
+        "debug_log":   [] if is_debug else None,
     }
 
     log_game_event("started", {
@@ -624,13 +664,14 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
     # For adult mode: generate full cast bible and fix a seed
     is_adult = game.get("adult_mode", False)
     if is_adult:
-        nai_cast = await _generate_cast_bible_nai(phrase, who_answer=who)
+        nai_cast = await _generate_cast_bible_nai(phrase, who_answer=who,
+                                                   debug_log=game.get("debug_log"))
         game["nai_cast"] = nai_cast
         game["nai_tags"] = nai_cast[0]["tags"] if nai_cast else ""  # keep for legacy compat
         game["nai_seed"] = random.randint(0, 2**32 - 1)
         logger.info(f"Cast bible for {token}: {[c['name'] for c in nai_cast]}")
         # Origin image: parse all characters from the premise
-        structured   = await _scene_to_nai_structured(phrase, nai_cast)
+        structured   = await _scene_to_nai_structured(phrase, nai_cast, debug_log=game.get("debug_log"))
         quality_tags = "masterpiece, best quality, highly detailed, explicit"
         char_caps    = structured["char_captions"]
         image_prompt = {
@@ -649,12 +690,19 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
         f"Visual style: {style_prompt}. "
         f"One image only, no text."
     )
+    # Log player answers before generating
+    if game.get("debug_log") is not None:
+        _dbg(game["debug_log"], "PLAYER_ANSWERS",
+             f"who='{who}' | action='{action}' | where='{where}' | "
+             f"mood='{mood}' | twist='{twist}'\nphrase='{phrase}'")
+
     image_data, error_msg = await _generate_image(
         image_prompt,
         label=f"game {token} [{style_name}]",
         fallback_prompt=fallback_prompt,
         adult_mode=is_adult,
         nai_seed=game.get("nai_seed"),
+        debug_log=game.get("debug_log"),
     )
 
     # Keep the initial image so it can be included as panel 0 in the comic book
@@ -811,10 +859,12 @@ async def set_comic_rounds_callback(update: Update, context: ContextTypes.DEFAUL
         logger.info(f"Reusing character bible for comic {token}: {character_bible}")
 
     # For adult mode: pass full cast bible and seed into comic session
-    comic_sessions[token]["nai_cast"] = list(game.get("nai_cast", []))
-    comic_sessions[token]["nai_tags"] = game.get("nai_tags", "")
-    comic_sessions[token]["nai_seed"] = game.get("nai_seed",
+    comic_sessions[token]["nai_cast"]   = list(game.get("nai_cast", []))
+    comic_sessions[token]["nai_tags"]   = game.get("nai_tags", "")
+    comic_sessions[token]["nai_seed"]   = game.get("nai_seed",
                                             random.randint(0, 2**32 - 1))
+    comic_sessions[token]["debug_mode"] = game.get("debug_mode", False)
+    comic_sessions[token]["debug_log"]  = game.get("debug_log")  # None or list
 
     # Carry the initial image forward so compile_comic can include it
     comic_sessions[token]["initial_image_data"] = game.get("initial_image_data")
@@ -905,8 +955,38 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     scene_text = update.message.text.strip()
     panel_num  = comic["current_turn_index"] + 1
-    is_retry   = comic.get("retry_player") == chat_id  # True if this is their second attempt
+    is_retry   = comic.get("retry_player") == chat_id
 
+    try:
+        await _handle_comic_message_inner(
+            update, context, chat_id, token, comic, scene_text, panel_num, is_retry
+        )
+    except Exception as e:
+        logger.exception(f"Unhandled exception in handle_comic_message panel {panel_num} [{token}]: {e}")
+        # Ensure the game is never permanently frozen — force a skip and advance
+        comic.pop("retry_player", None)
+        comic["panels"].append({
+            "author_id":  chat_id,
+            "prompt":     scene_text,
+            "image_data": None,
+            "skipped":    True,
+        })
+        author_name = comic["player_names"].get(chat_id, "A player")
+        for pid in comic.get("player_order", []):
+            try:
+                await context.bot.send_message(
+                    chat_id=pid,
+                    text=f"⚠️ Panel {panel_num} skipped due to an unexpected error. Continuing the game.",
+                )
+            except Exception:
+                pass
+        await _advance_comic(context, token)
+
+
+async def _handle_comic_message_inner(
+    update, context, chat_id, token, comic, scene_text, panel_num, is_retry
+):
+    """Core logic for processing a comic panel submission."""
     await update.message.reply_text(f"✅ Got it! Generating panel {panel_num}… 🎨")
 
     # Generate panel image — use NAI-optimised prompt and fixed seed for adult mode
@@ -943,6 +1023,8 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
         nai_refs   = None
         panel_seed = None
 
+    _dbg(comic.get("debug_log"), f"PANEL_{panel_num}_PLAYER_INPUT", scene_text)
+
     fallback = _build_panel_fallback_prompt(comic, scene_text)
     image_data, image_error = await _generate_image(
         prompt,
@@ -951,6 +1033,7 @@ async def handle_comic_message(update: Update, context: ContextTypes.DEFAULT_TYP
         adult_mode=is_adult,
         nai_seed=panel_seed,
         nai_references=nai_refs if is_adult else None,
+        debug_log=comic.get("debug_log"),
     )
 
     # Any failure — offer one retry, then auto-skip
@@ -1287,6 +1370,36 @@ async def compile_comic(context: ContextTypes.DEFAULT_TYPE, token: str):
             )
         except Exception as e:
             logger.error(f"Failed to send credits to {pid}: {e}")
+
+    # --- Debug report (debug mode only) ---
+    debug_log = comic.get("debug_log")
+    if debug_log:
+        host_id = player_order[0]
+        try:
+            report_lines = [
+                f"🐛 DEBUG REPORT — Game {token}",
+                f"Mode: Adult Debug | Style: {comic['style_name']}",
+                f"Players: {', '.join(player_names.values())}",
+                f"Rounds: {comic['rounds']} | Panels: {comic['num_panels']}",
+                "=" * 60,
+            ]
+            for entry in debug_log:
+                report_lines.append(f"\n[{entry['ts']}] {entry['step']}")
+                report_lines.append(entry['data'])
+                report_lines.append("-" * 40)
+            report_text = "\n".join(report_lines)
+
+            # Send as a .txt file
+            report_bytes = report_text.encode("utf-8")
+            from io import BytesIO
+            await context.bot.send_document(
+                chat_id=host_id,
+                document=BytesIO(report_bytes),
+                filename=f"debug_{token}.txt",
+                caption=f"🐛 Debug report for game {token}",
+            )
+        except Exception as e:
+            logger.error(f"Failed to send debug report: {e}")
 
     # Clean up session
     comic_sessions.pop(token, None)
@@ -1653,7 +1766,7 @@ def _load_fonts():
 # Adult image generation via NovelAI
 # ---------------------------------------------------------------------------
 
-async def _generate_cast_bible_nai(original_phrase: str, who_answer: str = "") -> list[dict]:
+async def _generate_cast_bible_nai(original_phrase: str, who_answer: str = "", debug_log: list | None = None) -> list[dict]:
     """Generate a full cast bible for the story as a list of character dicts.
     Each dict has 'name' (short label) and 'tags' (Danbooru appearance tags).
     The main character is always index 0.
@@ -1720,6 +1833,8 @@ async def _generate_cast_bible_nai(original_phrase: str, who_answer: str = "") -
             ],
         )
         raw = response.choices[0].message.content.strip()
+        _dbg(debug_log, "CAST_BIBLE_GROQ_RESPONSE", raw)
+        _dbg(debug_log, "CAST_BIBLE_INPUT", f"phrase='{original_phrase}' | who='{who_answer}'")
         if "```" in raw:
             for part in raw.split("```"):
                 part = part.strip().lstrip("json").strip()
@@ -1738,6 +1853,8 @@ async def _generate_cast_bible_nai(original_phrase: str, who_answer: str = "") -
                     "tags": str(entry["tags"]).strip(),
                 })
         logger.info(f"Cast bible: {[(c['name'], c['tags'][:60]) for c in validated]}")
+        _dbg(debug_log, "CAST_BIBLE_RESULT",
+             "\n".join(f"  {c['name']}: {c['tags']}" for c in validated))
         return validated if validated else [{"name": "main", "tags": ""}]
     except Exception as e:
         logger.warning(f"Cast bible generation failed: {e}")
@@ -1793,7 +1910,7 @@ def _char_count_prefix(char_captions: list) -> str:
     return count_map.get(len(char_captions), f"{len(char_captions)}characters") + ", "
 
 
-async def _scene_to_nai_structured(scene_text: str, cast: list[dict]) -> dict:
+async def _scene_to_nai_structured(scene_text: str, cast: list[dict], debug_log: list | None = None) -> dict:
     """Use Groq (Llama) to parse a scene using the full cast bible.
     Returns {"scene_tags": str, "char_captions": [{"char_caption": str} ...]}
     where char_captions contains ONLY characters who actually appear in this scene,
@@ -1894,6 +2011,11 @@ async def _scene_to_nai_structured(scene_text: str, cast: list[dict]) -> dict:
 
         logger.info(f"Scene parsed — tags: '{scene_tags[:80]}' | "
                     f"chars: {present} ({len(char_captions)} captions)")
+        _dbg(debug_log, "SCENE_PARSER_INPUT",
+             f"scene='{scene_text[:200]}' | cast={[c['name'] for c in cast]}")
+        _dbg(debug_log, "SCENE_PARSER_RESULT",
+             f"scene_tags='{scene_tags}'\npresent={present}\n"
+             + "\n".join(f"  char[{i}]: {c.get('char_caption','')[:80]}" for i, c in enumerate(char_captions)))
         return {"scene_tags": scene_tags, "char_captions": char_captions}
 
     except Exception as e:
@@ -1955,18 +2077,29 @@ async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
         nai_tags = comic.get("nai_tags", "")
         cast = [{"name": "main", "tags": nai_tags}] if nai_tags else []
 
-    structured    = await _scene_to_nai_structured(scene_text, cast)
+    structured    = await _scene_to_nai_structured(scene_text, cast, debug_log=comic.get("debug_log"))
     scene_tags    = structured["scene_tags"]
     char_captions = structured["char_captions"]
-    cast_names    = {c["name"] for c in cast}
-
-    # Only run new character detection if the scene parser returned MORE characters
-    # than are in the existing cast — i.e. it couldn't resolve all names to cast labels.
-    # If all present_chars were resolved to existing cast members, skip this step entirely.
-    # This prevents player-used proper names (like "Jack" = "partner") from being
-    # treated as brand-new characters by the secondary detection pass.
+    cast_names_lower = {c["name"].lower() for c in cast}
     scene_char_count = len(char_captions)
-    if scene_char_count > len(cast):
+
+    # Detect new characters via two signals:
+    # 1. Scene parser returned more chars than exist in cast (existing logic)
+    # 2. Player's raw text contains a capitalised proper name not in the cast
+    #    e.g. "Sergio joins them" when cast has ['Maria','Tom'] → Sergio is genuinely new
+    import re
+    words_in_scene = set(re.findall(r"\b[A-Z][a-z]{2,}\b", scene_text))
+    common_words   = {"Panel", "Scene", "Then", "They", "Them", "Their", "There",
+                      "When", "What", "With", "From", "Into", "After", "Before",
+                      "While", "During", "Around", "Behind", "Between"}
+    unknown_names  = {w for w in words_in_scene
+                      if w.lower() not in cast_names_lower and w not in common_words}
+    if unknown_names:
+        logger.info(f"Potential new characters in scene text: {unknown_names}")
+
+    should_detect_new = (scene_char_count > len(cast)) or bool(unknown_names)
+
+    if should_detect_new:
         # Scene parser found more characters than exist in cast — genuinely new
         try:
             client = AsyncOpenAI(
@@ -2012,13 +2145,13 @@ async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
                 for nc in new_chars:
                     if isinstance(nc, dict) and nc.get("name") and nc.get("description"):
                         name = nc["name"].strip()
-                        if name not in cast_names:
+                        if name.lower() not in cast_names_lower:
                             tags = await _generate_char_tags_nai(nc["description"])
                             if tags:
                                 new_entry = {"name": name, "tags": tags}
                                 cast.append(new_entry)
                                 comic["nai_cast"] = cast
-                                cast_names.add(name)
+                                cast_names_lower.add(name.lower())
                                 char_captions.append({"char_caption": tags})
                                 centers = _distributed_centers(len(char_captions))
                                 for i, cap in enumerate(char_captions):
@@ -2027,7 +2160,7 @@ async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
         except Exception as e:
             logger.warning(f"New character detection failed: {e}")
     else:
-        logger.info(f"Skipping new char detection — scene parser resolved all {scene_char_count} chars to existing cast")
+        logger.info(f"Skipping new char detection — no unknown names detected in scene")
 
     # Log the final char_captions being sent to NAI for debugging
     for i, cap in enumerate(char_captions):
@@ -2056,6 +2189,7 @@ async def _generate_image_adult(
     label: str = "",
     seed: int | None = None,
     reference_images: list[bytes] | None = None,
+    debug_log: list | None = None,
 ) -> tuple[bytes | None, str | None]:
     """Generate adult anime image via NovelAI V4.5 (nai-diffusion-4-5-full).
     prompt_data can be:
@@ -2096,7 +2230,7 @@ async def _generate_image_adult(
                     "base_caption": input_str,
                     "char_captions": char_captions,
                 },
-                "use_coords": len(char_captions) > 1,  # activate placement for multi-char
+                "use_coords": len(char_captions) > 1 and not reference_images,  # disabled with vibe refs — suspected conflict
                 "use_order":  len(char_captions) > 1,
             },
             "v4_negative_prompt": {
@@ -2177,6 +2311,17 @@ async def _generate_image_adult(
         )
         for i, cap in enumerate(char_captions):
             logger.info(f"  char[{i}]: {str(cap)[:120]}")
+
+        # Debug mode: capture full payload (excluding image bytes)
+        if debug_log is not None:
+            import copy
+            payload_safe = copy.deepcopy(payload)
+            if "reference_image_multiple" in payload_safe.get("parameters", {}):
+                n_refs = len(payload_safe["parameters"]["reference_image_multiple"])
+                payload_safe["parameters"]["reference_image_multiple"] = \
+                    [f"<base64 image {i+1} — omitted>" for i in range(n_refs)]
+            import json as _json
+            _dbg(debug_log, f"NAI_PAYLOAD [{label}]", _json.dumps(payload_safe, indent=2))
 
         async with httpx.AsyncClient(timeout=120) as client:
             response = await client.post(
@@ -2315,6 +2460,8 @@ async def _generate_image_adult(
             return None, "⚠️ NovelAI: could not parse image from response (all formats failed)."
 
         logger.info(f"NAI image parsed via [{parse_method}] [{label}]")
+        _dbg(debug_log, f"NAI_RESPONSE [{label}]",
+             f"status=200 | parse={parse_method} | size={len(image_bytes) if image_bytes else 0}B")
 
         # Validate that the bytes are actually a readable image before returning.
         # Corrupt bytes would crash PIL downstream in _build_comic_strip.
@@ -2398,16 +2545,16 @@ async def _generate_image(
     adult_mode: bool = False,
     nai_seed: int | None = None,
     nai_references: list[bytes] | None = None,
+    debug_log: list | None = None,
 ) -> tuple[bytes | None, str | None]:
-    """Generate an image. Routes to NovelAI V4.5 for adult mode, OpenAI otherwise.
-    For adult mode, prompt may be a dict from _build_panel_prompt_adult.
-    nai_references: optional list of raw image bytes for Vibe Transfer."""
+    """Generate an image. Routes to NovelAI V4.5 for adult mode, OpenAI otherwise."""
     if adult_mode:
         return await _generate_image_adult(
             prompt,
             label=label,
             seed=nai_seed,
             reference_images=nai_references,
+            debug_log=debug_log,
         )
 
     logger.info(f"Generating image [{label}]: {prompt[:200]}")
