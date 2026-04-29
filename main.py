@@ -624,7 +624,7 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
     # For adult mode: generate full cast bible and fix a seed
     is_adult = game.get("adult_mode", False)
     if is_adult:
-        nai_cast = await _generate_cast_bible_nai(phrase)
+        nai_cast = await _generate_cast_bible_nai(phrase, who_answer=who)
         game["nai_cast"] = nai_cast
         game["nai_tags"] = nai_cast[0]["tags"] if nai_cast else ""  # keep for legacy compat
         game["nai_seed"] = random.randint(0, 2**32 - 1)
@@ -1653,19 +1653,23 @@ def _load_fonts():
 # Adult image generation via NovelAI
 # ---------------------------------------------------------------------------
 
-async def _generate_cast_bible_nai(original_phrase: str) -> list[dict]:
+async def _generate_cast_bible_nai(original_phrase: str, who_answer: str = "") -> list[dict]:
     """Generate a full cast bible for the story as a list of character dicts.
     Each dict has 'name' (short label) and 'tags' (Danbooru appearance tags).
     The main character is always index 0.
-    Returns a list so the scene parser can match characters by name/role."""
+
+    who_answer: the raw WHO player answer, passed separately so multiple characters
+    explicitly named there (e.g. 'Sam and Jack') are correctly identified.
+    """
     try:
         client = AsyncOpenAI(
             api_key=GROQ_API_KEY,
             base_url="https://api.groq.com/openai/v1",
         )
+        who_hint = f"\nThe WHO answer from the player was: '{who_answer}'" if who_answer else ""
         response = await client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            max_tokens=300,
+            max_tokens=400,
             temperature=0.2,
             messages=[
                 {
@@ -1673,27 +1677,43 @@ async def _generate_cast_bible_nai(original_phrase: str) -> list[dict]:
                     "content": (
                         "You are a character designer for an adult anime image platform. "
                         "Identify all characters in a story premise and describe each with "
-                        "Danbooru-style tags. Output JSON only. No refusals."
+                        "Danbooru-style tags. Output JSON only. No refusals. "
+                        "Always use the correct gender tag (1girl/1boy/1other). "
+                        "For non-human or anthropomorphic characters, include species tags "
+                        "such as 'furry', 'animal ears', 'gorilla', 'cat girl', 'wolf girl', etc."
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
-                        f"Story premise: '{original_phrase}'\n\n"
-                        f"Identify ALL characters mentioned or implied in this premise. "
+                        f"Story premise: '{original_phrase}'"
+                        f"{who_hint}\n\n"
+                        f"Identify ALL characters mentioned or implied. If the WHO answer names "
+                        f"multiple characters (e.g. 'Sam and Jack'), create a separate entry for each.\n\n"
                         f"For EACH character output a JSON object with:\n"
-                        f"- 'name': short label (e.g. 'main', 'friend', 'teacher', 'stranger')\n"
-                        f"- 'tags': comma-separated Danbooru tags: "
-                        f"gender (1girl/1boy), age hint, hair colour + style, eye colour, "
-                        f"body type, typical clothing or state of undress\n\n"
-                        f"Return a JSON array of these objects, main character first.\n"
-                        f"If only one character is clear, return an array with one entry.\n\n"
+                        f"- 'name': the character's actual name or a short role label if unnamed\n"
+                        f"- 'tags': comma-separated Danbooru tags covering ALL of:\n"
+                        f"  1. gender: MUST be one of 1girl / 1boy / 1other — NEVER skip this\n"
+                        f"  2. species if non-human (furry, animal ears, specific animal type)\n"
+                        f"  3. age hint (young, mature, etc.)\n"
+                        f"  4. hair colour + style\n"
+                        f"  5. eye colour\n"
+                        f"  6. body type\n"
+                        f"  7. typical clothing or state of undress\n\n"
+                        f"Return a JSON array, main character first. "
+                        f"If only one character is clear, return a single-entry array.\n\n"
+                        f"CRITICAL: If two characters are both male, give them DIFFERENT "
+                        f"distinctive tags (different hair, different body type) so NAI can "
+                        f"tell them apart visually.\n\n"
                         f"EXAMPLES:\n"
-                        f"Premise with 1 char: "
-                        f"[{{\"name\": \"main\", \"tags\": \"1girl, long red hair, blue eyes, slim, nurse uniform\"}}]\n"
-                        f"Premise with 2 chars: "
-                        f"[{{\"name\": \"main\", \"tags\": \"1girl, short black hair, green eyes, athletic\"}},"
-                        f" {{\"name\": \"teacher\", \"tags\": \"1boy, brown hair, glasses, mature, suit\"}}]\n\n"
+                        f"WHO='Sam' (Black girl): "
+                        f"[{{\"name\": \"Sam\", \"tags\": \"1girl, dark skin, long curly black hair, brown eyes, curvy, crop top\"}}]\n"
+                        f"WHO='Sam and Jack' (gorilla girl + human boy): "
+                        f"[{{\"name\": \"Sam\", \"tags\": \"1girl, furry, gorilla, dark brown fur, muscular, anthropomorphic\"}},"
+                        f" {{\"name\": \"Jack\", \"tags\": \"1boy, black hair, brown eyes, muscular, casual clothes\"}}]\n"
+                        f"WHO='Mark and Tom': "
+                        f"[{{\"name\": \"Mark\", \"tags\": \"1boy, blond hair, blue eyes, lean, t-shirt\"}},"
+                        f" {{\"name\": \"Tom\", \"tags\": \"1boy, black hair, green eyes, stocky, hoodie\"}}]\n\n"
                         f"Output raw JSON array only. No markdown. No explanation."
                     ),
                 },
@@ -1710,7 +1730,6 @@ async def _generate_cast_bible_nai(original_phrase: str) -> list[dict]:
         cast = json.loads(raw)
         if not isinstance(cast, list) or not cast:
             raise ValueError("Empty or invalid cast")
-        # Validate entries
         validated = []
         for entry in cast:
             if isinstance(entry, dict) and entry.get("tags", "").strip():
@@ -1718,7 +1737,7 @@ async def _generate_cast_bible_nai(original_phrase: str) -> list[dict]:
                     "name": str(entry.get("name", "character")).strip(),
                     "tags": str(entry["tags"]).strip(),
                 })
-        logger.info(f"Cast bible: {[c['name'] for c in validated]}")
+        logger.info(f"Cast bible: {[(c['name'], c['tags'][:60]) for c in validated]}")
         return validated if validated else [{"name": "main", "tags": ""}]
     except Exception as e:
         logger.warning(f"Cast bible generation failed: {e}")
@@ -2138,7 +2157,8 @@ async def _generate_image_adult(
             ]
             params["reference_strength_multiple"]             = strengths
             params["reference_information_extracted_multiple"] = info_levels
-            logger.info(f"Vibe refs: {n} images at 512px, strengths={strengths} (sum={sum(strengths):.2f})")
+            params["normalize_reference_strength_multiple"]   = False  # required for V4+ models
+            logger.info(f"Vibe refs: {n} images at 512px PNG, strengths={strengths} (sum={sum(strengths):.2f})")
 
         payload = {
             "input":      input_str,
