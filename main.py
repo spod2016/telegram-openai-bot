@@ -707,8 +707,9 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
         structured   = await _scene_to_nai_structured(phrase, nai_cast, debug_log=game.get("debug_log"))
         quality_tags = "masterpiece, best quality, highly detailed, explicit"
         char_caps    = structured["char_captions"]
+        raw_prefix   = phrase.rstrip(".,!?") + ", "
         image_prompt = {
-            "input":        f"{_char_count_prefix(char_caps)}{quality_tags}, {structured['scene_tags']}",
+            "input":        f"{_char_count_prefix(char_caps)}{quality_tags}, {raw_prefix}{structured['scene_tags']}",
             "char_captions": char_caps,
         }
     else:
@@ -2029,26 +2030,25 @@ async def _scene_to_nai_structured(
             present = ["main"]
 
         # Build char_captions from cast bible using matched names.
-        # Fix 6: exclude 1other (non-human background elements like sharks, creatures)
-        # from char_captions — NAI treats char_captions as foreground character slots.
-        # Put 1other tags into scene_tags instead so they render as background/environment.
+        # Build char_captions from cast bible using matched names.
+        # IMPORTANT: skip names not found in cast — do NOT fall back to cast[0] which
+        # creates duplicate characters. Unknown names are handled by new char detection.
         cast_by_name = {c["name"]: c["tags"] for c in cast}
         char_captions = []
         other_tags_for_scene = []
         for name in present:
-            tags = cast_by_name.get(name, cast[0]["tags"] if cast else "")
-            if tags:
-                if "1other" in tags:
-                    # Fix: only add the entity NAME to scene_tags (e.g. "shark"),
-                    # NOT physical appearance tags like "grey scales, sharp teeth"
-                    # which bleed into human character rendering via base_caption.
-                    entity_name = name.lower()
-                    other_tags_for_scene.append(entity_name)
-                    logger.info(f"1other '{name}' added to scene_tags as: '{entity_name}' (appearance tags omitted)")
-                else:
-                    char_captions.append({"char_caption": tags})
+            tags = cast_by_name.get(name)
+            if tags is None:
+                logger.info(f"Scene parser: '{name}' not in cast — skipping (new char detection will handle)")
+                continue
+            if "1other" in tags:
+                # Only add entity name to scene_tags — no appearance descriptors
+                other_tags_for_scene.append(name.lower())
+                logger.info(f"1other '{name}' added to scene_tags as '{name.lower()}'")
+            else:
+                char_captions.append({"char_caption": tags})
 
-        # Append 1other descriptors to scene tags
+        # Append 1other entity names to scene tags
         if other_tags_for_scene:
             scene_tags = scene_tags + ", " + ", ".join(other_tags_for_scene)
 
@@ -2308,8 +2308,13 @@ async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
     for i, cap in enumerate(char_captions):
         logger.info(f"NAI char_caption[{i}]: {cap.get('char_caption', '')[:100]}")
 
+    # Fix 2: Include the player's raw text directly in base_caption.
+    # NAI V4.5 understands natural language — this ensures specific details
+    # ("riding cock", "blowing at the same time") aren't lost in tag translation.
+    # Format: natural language first, then Danbooru tags.
+    raw_text_prefix = scene_text.strip().rstrip(".,!?") + ", "
     return {
-        "input":         f"{_char_count_prefix(char_captions)}{quality_tags}, {scene_tags}",
+        "input":         f"{_char_count_prefix(char_captions)}{quality_tags}, {raw_text_prefix}{scene_tags}",
         "char_captions": char_captions,
         "present_chars": [c["char_caption"] for c in char_captions],
     }
