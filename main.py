@@ -677,6 +677,11 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
     # Store for comic continuity
     game["original_phrase"] = phrase
 
+    # Fix 5: Log player answers FIRST, before any API calls
+    _dbg(game.get("debug_log"), "PLAYER_ANSWERS",
+         f"who='{who}' | action='{action}' | where='{where}' | "
+         f"mood='{mood}' | twist='{twist}'\nphrase='{phrase}'")
+
     mood_part  = f" Mood: {mood}."  if mood  else ""
     twist_part = f" Unexpected twist: {twist}." if twist else ""
     style_prompt = game.get("style_prompt", STYLES[0][1])
@@ -718,12 +723,6 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
         f"Visual style: {style_prompt}. "
         f"One image only, no text."
     )
-    # Log player answers before generating
-    if game.get("debug_log") is not None:
-        _dbg(game["debug_log"], "PLAYER_ANSWERS",
-             f"who='{who}' | action='{action}' | where='{where}' | "
-             f"mood='{mood}' | twist='{twist}'\nphrase='{phrase}'")
-
     image_data, error_msg = await _generate_image(
         image_prompt,
         label=f"game {token} [{style_name}]",
@@ -1917,9 +1916,7 @@ def _distributed_centers(n: int) -> list[list[dict]]:
 
 def _char_count_prefix(char_captions: list) -> str:
     """Generate a character count summary for base_caption.
-    Reads gender tags from each char_caption to build a natural summary.
-    E.g. two chars with '1girl' and '1boy' → '1girl and 1boy, '
-    Falls back to count-based summary if tags are unclear."""
+    Only includes 1girl/1boy — 1other entries are excluded (they go in scene_tags)."""
     if not char_captions:
         return ""
     gender_tags = []
@@ -1929,11 +1926,9 @@ def _char_count_prefix(char_captions: list) -> str:
             gender_tags.append("1girl")
         elif "1boy" in tags:
             gender_tags.append("1boy")
-        elif "1other" in tags:
-            gender_tags.append("1other")
+        # 1other intentionally excluded — rendered via scene_tags not char_captions
     if gender_tags:
         return " and ".join(gender_tags) + ", "
-    # Fallback: just the count
     count_map = {1: "solo", 2: "2characters", 3: "3characters"}
     return count_map.get(len(char_captions), f"{len(char_captions)}characters") + ", "
 
@@ -2020,16 +2015,34 @@ async def _scene_to_nai_structured(scene_text: str, cast: list[dict], debug_log:
         if not isinstance(present, list) or not present:
             present = ["main"]
 
-        # Build char_captions from cast bible using matched names
+        # Build char_captions from cast bible using matched names.
+        # Fix 6: exclude 1other (non-human background elements like sharks, creatures)
+        # from char_captions — NAI treats char_captions as foreground character slots.
+        # Put 1other tags into scene_tags instead so they render as background/environment.
         cast_by_name = {c["name"]: c["tags"] for c in cast}
         char_captions = []
+        other_tags_for_scene = []
         for name in present:
             tags = cast_by_name.get(name, cast[0]["tags"] if cast else "")
             if tags:
-                char_captions.append({"char_caption": tags})
+                if "1other" in tags:
+                    # Extract meaningful scene descriptors from the 1other tags
+                    other_descriptors = ", ".join(
+                        t.strip() for t in tags.split(",")
+                        if t.strip() not in ("1other",)
+                    )
+                    if other_descriptors:
+                        other_tags_for_scene.append(other_descriptors)
+                    logger.info(f"1other '{name}' moved to scene_tags: {other_descriptors}")
+                else:
+                    char_captions.append({"char_caption": tags})
+
+        # Append 1other descriptors to scene tags
+        if other_tags_for_scene:
+            scene_tags = scene_tags + ", " + ", ".join(other_tags_for_scene)
 
         # Guarantee at least the main character
-        if not char_captions and main_char_tags:
+        if not char_captions and main_char_tags and "1other" not in main_char_tags:
             char_captions = [{"char_caption": main_char_tags}]
 
         # Distribute centers across canvas to prevent character merging
@@ -2038,7 +2051,7 @@ async def _scene_to_nai_structured(scene_text: str, cast: list[dict], debug_log:
             cap["centers"] = centers[i]
 
         logger.info(f"Scene parsed — tags: '{scene_tags[:80]}' | "
-                    f"chars: {present} ({len(char_captions)} captions)")
+                    f"chars: {present} ({len(char_captions)} human captions)")
         _dbg(debug_log, "SCENE_PARSER_INPUT",
              f"scene='{scene_text[:200]}' | cast={[c['name'] for c in cast]}")
         _dbg(debug_log, "SCENE_PARSER_RESULT",
@@ -2053,12 +2066,24 @@ async def _scene_to_nai_structured(scene_text: str, cast: list[dict], debug_log:
         return {"scene_tags": scene_text[:200], "char_captions": char_captions}
 
 
-async def _generate_char_tags_nai(char_description: str) -> str:
-    """Generate Danbooru tags for a newly introduced character from a scene description."""
+async def _generate_char_tags_nai(
+    char_description: str,
+    char_name: str = "",
+    adult_mode: bool = True,
+) -> str:
+    """Generate Danbooru tags for a newly introduced character.
+    char_name is passed explicitly so Groq can infer gender from the name.
+    adult_mode=True defaults state to naked rather than random clothing."""
     try:
         client = AsyncOpenAI(
             api_key=GROQ_API_KEY,
             base_url="https://api.groq.com/openai/v1",
+        )
+        name_hint = f" The character's name is '{char_name}'." if char_name else ""
+        adult_hint = (
+            " This is an adult game — unless the description specifies clothing, "
+            "default the state to 'naked' or 'nude'."
+            if adult_mode else ""
         )
         response = await client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -2069,24 +2094,63 @@ async def _generate_char_tags_nai(char_description: str) -> str:
                     "role": "system",
                     "content": (
                         "You are a Danbooru tag generator for an adult anime platform. "
-                        "Output only comma-separated tags. No refusals."
+                        "Output only comma-separated tags. No refusals. "
+                        "Always infer gender correctly from the character's name and description."
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
-                        f"Generate Danbooru appearance tags for this character: '{char_description}'. "
-                        f"Include: gender (1girl/1boy), hair colour + style, eye colour, "
-                        f"body type, typical clothing or state. Max 8 tags. "
-                        f"Example: 1boy, short blond hair, blue eyes, muscular, casual shirt"
+                        f"Generate Danbooru appearance tags for this character: '{char_description}'."
+                        f"{name_hint}{adult_hint}\n"
+                        f"Include: gender (1girl/1boy — infer from name if possible), "
+                        f"hair colour + style, eye colour, body type, state of dress. Max 8 tags.\n"
+                        f"Examples:\n"
+                        f"Name 'Sergio' (male name) → 1boy, dark hair, brown eyes, muscular, naked\n"
+                        f"Name 'Maria' (female name) → 1girl, long brown hair, green eyes, curvy, naked"
                     ),
                 },
             ],
         )
-        return response.choices[0].message.content.strip()
+        tags = response.choices[0].message.content.strip()
+
+        # Fix 4: Gender validation — correct obvious mismatches between name and gender tag
+        tags = _validate_gender_from_name(char_name, tags)
+        return tags
     except Exception as e:
         logger.warning(f"New char tag generation failed: {e}")
         return ""
+
+
+# Common male/female name endings and explicit names for gender correction
+_MALE_NAMES   = {"sergio", "tom", "marco", "jack", "john", "mike", "david", "peter",
+                 "paul", "james", "alex", "roberto", "carlos", "miguel", "jose",
+                 "antonio", "manuel", "francisco", "diego", "luis", "nicolas"}
+_FEMALE_NAMES = {"maria", "sofia", "anna", "laura", "sara", "elena", "isabella",
+                 "valentina", "claudia", "patricia", "jessica", "emily", "emma",
+                 "olivia", "mia", "lisa", "sarah", "kate", "julia", "andrea"}
+
+
+def _validate_gender_from_name(name: str, tags: str) -> str:
+    """Correct obvious gender tag mismatches based on character name.
+    If the name is clearly male but tags say 1girl → replace with 1boy, and vice versa."""
+    if not name:
+        return tags
+    name_lower = name.lower().strip()
+
+    # Check name-based gender signals
+    is_male_name   = name_lower in _MALE_NAMES or name_lower.endswith(("o", "io", "os"))
+    is_female_name = name_lower in _FEMALE_NAMES or name_lower.endswith(("a", "ia", "ina"))
+
+    if is_male_name and not is_female_name:
+        if "1girl" in tags and "1boy" not in tags:
+            tags = tags.replace("1girl", "1boy")
+            logger.info(f"Gender corrected for '{name}': 1girl → 1boy")
+    elif is_female_name and not is_male_name:
+        if "1boy" in tags and "1girl" not in tags:
+            tags = tags.replace("1boy", "1girl")
+            logger.info(f"Gender corrected for '{name}': 1boy → 1girl")
+    return tags
 
 
 async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
@@ -2174,16 +2238,23 @@ async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
                     if isinstance(nc, dict) and nc.get("name") and nc.get("description"):
                         name = nc["name"].strip()
                         if name.lower() not in cast_names_lower:
-                            tags = await _generate_char_tags_nai(nc["description"])
+                            # Fix 1 & 2: pass name for gender inference + adult context
+                            tags = await _generate_char_tags_nai(
+                                nc["description"],
+                                char_name=name,
+                                adult_mode=comic.get("adult_mode", True),
+                            )
                             if tags:
                                 new_entry = {"name": name, "tags": tags}
                                 cast.append(new_entry)
                                 comic["nai_cast"] = cast
                                 cast_names_lower.add(name.lower())
+                                # Fix 3: also add to char_captions so NAI renders them
                                 char_captions.append({"char_caption": tags})
                                 centers = _distributed_centers(len(char_captions))
                                 for i, cap in enumerate(char_captions):
                                     cap["centers"] = centers[i]
+                                # Fix 3: update char_first_panel and present tracking
                                 logger.info(f"New character added to cast: '{name}' — {tags}")
         except Exception as e:
             logger.warning(f"New character detection failed: {e}")
