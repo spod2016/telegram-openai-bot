@@ -2114,7 +2114,8 @@ async def _scene_to_nai_structured(
 
     except Exception as e:
         logger.warning(f"Structured scene parsing failed: {e} — falling back")
-        char_captions = [{"char_caption": main_char_tags,
+        main_name = cast[0]["name"] if cast else "main"
+        char_captions = [{"char_caption": f"{main_name}, {main_char_tags}",
                            "centers": _distributed_centers(1)[0]}] if main_char_tags else []
         return {"scene_tags": scene_text[:200], "char_captions": char_captions}
 
@@ -2334,13 +2335,13 @@ async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
                                 cast.append(new_entry)
                                 comic["nai_cast"] = cast
                                 cast_names_lower.add(name.lower())
-                                # Fix 3: also add to char_captions so NAI renders them
-                                char_captions.append({"char_caption": tags})
+                                # Include name prefix (Fix 3) and add to char_captions
+                                new_caption = f"{name}, {tags}"
+                                char_captions.append({"char_caption": new_caption})
                                 centers = _distributed_centers(len(char_captions))
                                 for i, cap in enumerate(char_captions):
                                     cap["centers"] = centers[i]
-                                # Fix 3: update char_first_panel and present tracking
-                                logger.info(f"New character added to cast: '{name}' — {tags}")
+                                logger.info(f"New character added to cast: '{name}' — {new_caption}")
         except Exception as e:
             logger.warning(f"New character detection failed: {e}")
     else:
