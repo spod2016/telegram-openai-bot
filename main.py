@@ -569,7 +569,23 @@ async def receive_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Answer received! Waiting for other players...")
 
     if len(game["answers"]) == game["num_players"]:
-        await finalize_game(context, token)
+        try:
+            await finalize_game(context, token)
+        except Exception as e:
+            logger.exception(f"finalize_game failed for {token}: {e}")
+            for pid in game.get("player_order", [chat_id]):
+                try:
+                    await context.bot.send_message(
+                        chat_id=pid,
+                        text=(
+                            "⚠️ <b>Something went wrong generating the image.</b>\n\n"
+                            "This is usually a temporary network issue. "
+                            "Please start a new game with /create."
+                        ),
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
 
     return ConversationHandler.END
 
@@ -604,7 +620,19 @@ async def receive_solo_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
         for i, ans in enumerate(game["solo_answers"]):
             game["answers"][chat_id] = ans  # placeholder — finalize reads solo_answers directly
         await update.message.reply_text("✅ All answers in! Generating your image… 🎨")
-        await finalize_game(context, token)
+        try:
+            await finalize_game(context, token)
+        except Exception as e:
+            logger.exception(f"finalize_game failed for solo {token}: {e}")
+            try:
+                await update.message.reply_text(
+                    "⚠️ <b>Something went wrong generating the image.</b>\n\n"
+                    "This is usually a temporary network issue. "
+                    "Please start a new game with /create.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
         return ConversationHandler.END
 
 
@@ -2787,6 +2815,26 @@ def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_comic_message),
         group=1,
     )
+
+    # Global error handler — catches any unhandled exception from any handler
+    # and notifies the user instead of silently dropping the update.
+    async def _global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.exception(f"Unhandled exception: {context.error}", exc_info=context.error)
+        if isinstance(update, Update) and update.effective_chat:
+            try:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=(
+                        "⚠️ <b>An unexpected error occurred.</b>\n\n"
+                        "This is usually a temporary network issue. "
+                        "Please try again or start a new game with /create."
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
+    app.add_error_handler(_global_error_handler)
 
     logger.info("Skazk.AI bot is running…")
     app.run_polling()
