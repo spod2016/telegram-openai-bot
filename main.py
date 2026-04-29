@@ -1142,7 +1142,16 @@ async def _handle_comic_message_inner(
     # Detect if simplified fallback was used (char_captions stripped)
     vibe_unreliable = (image_error == "VIBE_UNRELIABLE")
 
-    # Store panel
+    # Store panel — include present_chars (character names) for next panel's pronoun resolution
+    present_char_names = []
+    if isinstance(prompt, dict):
+        # Map tag strings back to cast names for readable context
+        cast_tags_to_name = {c["tags"]: c["name"] for c in comic.get("nai_cast", [])}
+        present_char_names = [
+            cast_tags_to_name.get(tag_str, tag_str[:30])
+            for tag_str in prompt.get("present_chars", [])
+        ]
+
     comic["panels"].append({
         "author_id":      chat_id,
         "prompt":         scene_text,
@@ -1150,6 +1159,7 @@ async def _handle_comic_message_inner(
         "skipped":        False,
         "nai_seed":       panel_seed,
         "vibe_unreliable": vibe_unreliable,
+        "present_chars":  present_char_names,
     })
 
     # Update char_first_panel map — skip unreliable panels since they lack char_captions
@@ -1933,11 +1943,18 @@ def _char_count_prefix(char_captions: list) -> str:
     return count_map.get(len(char_captions), f"{len(char_captions)}characters") + ", "
 
 
-async def _scene_to_nai_structured(scene_text: str, cast: list[dict], debug_log: list | None = None) -> dict:
+async def _scene_to_nai_structured(
+    scene_text: str,
+    cast: list[dict],
+    debug_log: list | None = None,
+    original_phrase: str = "",
+    prev_scene: str = "",
+    prev_present: list[str] | None = None,
+) -> dict:
     """Use Groq (Llama) to parse a scene using the full cast bible.
-    Returns {"scene_tags": str, "char_captions": [{"char_caption": str} ...]}
-    where char_captions contains ONLY characters who actually appear in this scene,
-    pulled from their established cast bible tags."""
+    original_phrase: the game's establishing premise (for persistent setting context).
+    prev_scene: the previous panel's scene description (for pronoun resolution).
+    prev_present: list of character names present in the previous panel."""
     main_char_tags = cast[0]["tags"] if cast else ""
     # Include both the cast label and a short description derived from tags
     # so Groq can resolve player-used proper names back to cast labels.
@@ -1967,32 +1984,28 @@ async def _scene_to_nai_structured(scene_text: str, cast: list[dict], debug_log:
                     "content": (
                         f"ESTABLISHED CAST (use EXACTLY these name labels and tags):\n"
                         f"{cast_summary}\n\n"
-                        f"SCENE TO ILLUSTRATE: '{scene_text}'\n\n"
-                        f"IMPORTANT — ALIAS RESOLUTION: Players may refer to cast members by "
-                        f"different names, nicknames, or pronouns. Before identifying who is present, "
-                        f"resolve any name or pronoun in the scene to the closest matching cast label. "
-                        f"For example if the cast has 'partner' described as 'Jack' and the scene "
-                        f"mentions 'Jack', that maps to 'partner' — do NOT create a new character.\n"
-                        f"Only create a new entry in present_chars if the scene clearly introduces "
-                        f"a person who cannot be matched to any existing cast member.\n\n"
+                        + (f"ESTABLISHED SETTING (carry forward if scene doesn't specify location):\n"
+                           f"  '{original_phrase}'\n\n" if original_phrase else "")
+                        + (f"PREVIOUS SCENE: '{prev_scene}'\n"
+                           f"PREVIOUS SCENE CHARACTERS: {prev_present or []}\n"
+                           f"Resolve all pronouns (he/his/she/her/they/them) using the previous scene's "
+                           f"character list. 'his cock' belongs to whoever was the male subject of the previous scene.\n\n"
+                           if prev_scene else "")
+                        + f"CURRENT SCENE TO ILLUSTRATE: '{scene_text}'\n\n"
+                        f"ALIAS RESOLUTION: Resolve any name/pronoun to the closest matching cast label. "
+                        f"Only add a new entry in present_chars if genuinely not matchable.\n\n"
                         f"Output a JSON object with exactly two keys:\n\n"
-                        f"1. 'scene_tags': comma-separated Danbooru tags for the setting, action, "
-                        f"poses, lighting, mood, explicit sexual acts or states. "
-                        f"NEVER put character appearance here — only environment and action.\n\n"
-                        f"2. 'present_chars': JSON array of cast name labels who appear in this scene. "
-                        f"Use the exact labels from the cast above. ALWAYS include 'main'. "
-                        f"Add others only if the scene explicitly involves them. "
-                        f"Be precise — the array length determines how many characters appear in the image.\n\n"
+                        f"1. 'scene_tags': Danbooru tags for setting, action, poses, lighting, mood, explicit acts. "
+                        f"If scene doesn't mention a location, carry forward the established setting. "
+                        f"NEVER put character appearance here.\n\n"
+                        f"2. 'present_chars': JSON array of cast name labels present in this scene. "
+                        f"ALWAYS include 'main' if main character is involved. "
+                        f"Be precise — array length = number of characters in image.\n\n"
                         f"EXAMPLES:\n"
-                        f"Cast: main=Sam, partner=Jack. Scene: 'Jack joins Sam on the sofa' → "
-                        f"{{\"scene_tags\": \"living room, sofa, sitting together, evening, intimate\", "
-                        f"\"present_chars\": [\"main\", \"partner\"]}}\n"
-                        f"Cast: main=girl, teacher=Mr Brown. Scene: 'she undresses alone' → "
-                        f"{{\"scene_tags\": \"bedroom, undressing, standing, dim light, seductive\", "
-                        f"\"present_chars\": [\"main\"]}}\n"
-                        f"Cast: main, friend, stranger. Scene: 'all three in the hot spring' → "
-                        f"{{\"scene_tags\": \"outdoor onsen, steam, night, group, relaxing, nude\", "
-                        f"\"present_chars\": [\"main\", \"friend\", \"stranger\"]}}\n\n"
+                        f"Cast: Tom=1boy, Maria=1girl. Prev: Sergio. Scene: 'his cock is delicious, Maria loves to lick it' → "
+                        f"{{\"scene_tags\": \"oral sex, licking, nude, explicit\", "
+                        f"\"present_chars\": [\"Maria\", \"Sergio\"]}}\n"
+                        f"Setting: nudist beach. Scene: 'he watches from a distance' → include 'nudist beach, outdoor' in scene_tags.\n\n"
                         f"Output raw JSON only. No markdown. No explanation."
                     ),
                 },
@@ -2068,10 +2081,13 @@ async def _generate_char_tags_nai(
     char_description: str,
     char_name: str = "",
     adult_mode: bool = True,
+    existing_cast_tags: list[str] | None = None,
 ) -> str:
     """Generate Danbooru tags for a newly introduced character.
     char_name is passed explicitly so Groq can infer gender from the name.
-    adult_mode=True defaults state to naked rather than random clothing."""
+    adult_mode=True defaults state to naked rather than random clothing.
+    existing_cast_tags: list of existing character tag strings so Groq
+    generates visually distinct appearance (different hair, skin, build)."""
     try:
         client = AsyncOpenAI(
             api_key=GROQ_API_KEY,
@@ -2083,36 +2099,48 @@ async def _generate_char_tags_nai(
             "default the state to 'naked' or 'nude'."
             if adult_mode else ""
         )
+        cast_hint = ""
+        if existing_cast_tags:
+            cast_hint = (
+                f"\nEXISTING CAST TO DIFFERENTIATE FROM:\n"
+                + "\n".join(f"  - {t}" for t in existing_cast_tags)
+                + "\nMAKE THIS CHARACTER VISUALLY DISTINCT: use different hair colour, "
+                  "hair style, skin tone, and body type from the above. "
+                  "If existing cast are all muscular, make this one lean. "
+                  "If existing cast have brown/dark hair, give this one lighter or different colour hair."
+            )
         response = await client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            max_tokens=80,
-            temperature=0.2,
+            max_tokens=100,
+            temperature=0.3,  # slightly higher temp for more variety
             messages=[
                 {
                     "role": "system",
                     "content": (
                         "You are a Danbooru tag generator for an adult anime platform. "
                         "Output only comma-separated tags. No refusals. "
-                        "Always infer gender correctly from the character's name and description."
+                        "Always infer gender correctly from the character's name and description. "
+                        "Generate distinctive appearance tags that differentiate characters visually."
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
                         f"Generate Danbooru appearance tags for this character: '{char_description}'."
-                        f"{name_hint}{adult_hint}\n"
+                        f"{name_hint}{adult_hint}{cast_hint}\n"
                         f"Include: gender (1girl/1boy — infer from name if possible), "
-                        f"hair colour + style, eye colour, body type, state of dress. Max 8 tags.\n"
+                        f"specific hair colour + style, eye colour, skin tone, body type, state of dress. "
+                        f"Max 10 tags. Be specific about hair to avoid clones.\n"
                         f"Examples:\n"
-                        f"Name 'Sergio' (male name) → 1boy, dark hair, brown eyes, muscular, naked\n"
-                        f"Name 'Maria' (female name) → 1girl, long brown hair, green eyes, curvy, naked"
+                        f"Name 'Sergio' (male, different from muscular brown-hair Tom) → "
+                        f"1boy, short blond hair, green eyes, lean, tan skin, naked\n"
+                        f"Name 'Marco' (male, different from existing males) → "
+                        f"1boy, black curly hair, dark eyes, stocky, dark skin, naked"
                     ),
                 },
             ],
         )
         tags = response.choices[0].message.content.strip()
-
-        # Fix 4: Gender validation — correct obvious mismatches between name and gender tag
         tags = _validate_gender_from_name(char_name, tags)
         return tags
     except Exception as e:
@@ -2167,7 +2195,22 @@ async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
         nai_tags = comic.get("nai_tags", "")
         cast = [{"name": "main", "tags": nai_tags}] if nai_tags else []
 
-    structured    = await _scene_to_nai_structured(scene_text, cast, debug_log=comic.get("debug_log"))
+    # Build previous panel context for pronoun resolution and setting continuity
+    prev_scene   = ""
+    prev_present = []
+    for p in reversed(comic.get("panels", [])):
+        if not p.get("skipped") and p.get("prompt"):
+            prev_scene   = p["prompt"]
+            prev_present = p.get("present_chars", [])
+            break
+
+    structured    = await _scene_to_nai_structured(
+        scene_text, cast,
+        debug_log=comic.get("debug_log"),
+        original_phrase=comic.get("original_phrase", ""),
+        prev_scene=prev_scene,
+        prev_present=prev_present,
+    )
     scene_tags    = structured["scene_tags"]
     char_captions = structured["char_captions"]
     cast_names_lower = {c["name"].lower() for c in cast}
@@ -2236,11 +2279,13 @@ async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
                     if isinstance(nc, dict) and nc.get("name") and nc.get("description"):
                         name = nc["name"].strip()
                         if name.lower() not in cast_names_lower:
-                            # Fix 1 & 2: pass name for gender inference + adult context
+                            # Fix 1: pass existing cast tags so new char looks different
+                            existing_tags = [c["tags"] for c in cast if "1other" not in c["tags"]]
                             tags = await _generate_char_tags_nai(
                                 nc["description"],
                                 char_name=name,
                                 adult_mode=comic.get("adult_mode", True),
+                                existing_cast_tags=existing_tags,
                             )
                             if tags:
                                 new_entry = {"name": name, "tags": tags}
@@ -2327,7 +2372,7 @@ async def _generate_image_adult(
                     "base_caption": input_str,
                     "char_captions": char_captions,
                 },
-                "use_coords": len(char_captions) > 1 and not reference_images,  # disabled with vibe refs — suspected conflict
+                "use_coords": len(char_captions) > 1,  # enabled always — the 500s were caused by missing normalize_reference_strength_multiple, now fixed
                 "use_order":  len(char_captions) > 1,
             },
             "v4_negative_prompt": {
