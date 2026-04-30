@@ -1966,6 +1966,68 @@ def _char_count_prefix(char_captions: list) -> str:
     return count_map.get(len(char_captions), f"{len(char_captions)}characters") + ", "
 
 
+async def _decompose_multi_action_scene(scene_text: str, cast: list[dict], debug_log: list | None = None) -> str:
+    """Suggestion 3: Pre-processing step for complex multi-action scenes.
+    Detects coordination words (while, as, at the same time, simultaneously, etc.)
+    and asks Groq to decompose the scene into explicit per-character action blocks.
+    Returns a rewritten scene string that is easier for the scene parser to handle.
+    If the scene is simple (no coordination words), returns the original text unchanged."""
+
+    # Coordination words that signal multiple simultaneous actions
+    COORDINATION_WORDS = {
+        "while", "as", "at the same time", "simultaneously", "meanwhile",
+        "also", "and also", "both", "together", "at once", "in the meantime"
+    }
+    scene_lower = scene_text.lower()
+    is_complex  = any(w in scene_lower for w in COORDINATION_WORDS)
+    # Also trigger if there are 3+ verbs — rough proxy for multi-action complexity
+    if not is_complex:
+        return scene_text  # Simple scene — pass through unchanged
+
+    logger.info("Multi-action scene detected — decomposing before scene parsing")
+    cast_names = ", ".join(c["name"] for c in cast)
+
+    try:
+        client = AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+        response = await client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            max_tokens=200,
+            temperature=0.1,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You rewrite complex multi-action scene descriptions into explicit "
+                        "per-character action statements. Output only the rewritten scene. "
+                        "No explanation, no preamble."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"CAST: {cast_names}\n"
+                        f"SCENE: '{scene_text}'\n\n"
+                        f"Rewrite this scene as a clear list of simultaneous actions, "
+                        f"one sentence per character, using their names explicitly. "
+                        f"Resolve pronouns to character names. Keep all details. "
+                        f"Format: '[Name] is [action]. [Name] is [action]. ...'\n\n"
+                        f"Example input: 'Maria rides Tom while Sergio grabs her breasts and kisses her neck'\n"
+                        f"Example output: 'Maria is riding Tom's cock in cowgirl position. "
+                        f"Tom is lying on his back being ridden. "
+                        f"Sergio is standing behind Maria, grabbing her breasts and kissing her neck.'"
+                    ),
+                },
+            ],
+        )
+        rewritten = response.choices[0].message.content.strip()
+        logger.info(f"Scene decomposed: '{scene_text[:80]}' → '{rewritten[:80]}'")
+        _dbg(debug_log, "SCENE_DECOMPOSED", f"original='{scene_text}'\nrewritten='{rewritten}'")
+        return rewritten
+    except Exception as e:
+        logger.warning(f"Scene decomposition failed: {e} — using original text")
+        return scene_text
+
+
 async def _scene_to_nai_structured(
     scene_text: str,
     cast: list[dict],
@@ -2023,19 +2085,24 @@ async def _scene_to_nai_structured(
                         f"NEVER put character appearance or per-character actions here.\n\n"
                         f"2. 'present_chars': JSON array of cast name labels present in this scene. "
                         f"Be precise — array length = number of characters in image.\n\n"
-                        f"3. 'char_actions': JSON object mapping each present character name to 2-4 "
-                        f"Danbooru pose/action tags describing WHAT THEY ARE DOING in this scene. "
-                        f"These are appended to their char_caption so NAI knows exactly who does what. "
-                        f"Focus on body position, role, and action — NOT appearance (no hair/eye color here).\n\n"
+                        f"3. 'char_actions': JSON object mapping each present character name to a "
+                        f"natural language phrase describing ALL simultaneous actions they perform in this scene. "
+                        f"Include every action — kissing AND grabbing AND moaning are all separate things that happen at once. "
+                        f"Do NOT compress multiple actions into 2-4 tags — capture everything the character does. "
+                        f"Write as comma-separated actions or a short phrase. Focus on body position, role, and action. "
+                        f"NOT appearance (no hair/eye color here).\n\n"
                         f"EXAMPLES:\n"
                         f"Scene: 'Tom fucks Maria from behind while she moans' → "
                         f"{{\"scene_tags\": \"doggystyle, explicit, nude, office\", "
                         f"\"present_chars\": [\"Tom\", \"Maria\"], "
-                        f"\"char_actions\": {{\"Tom\": \"thrusting, dominant, standing\", \"Maria\": \"bent over, receiving, moaning\"}}}}\n"
-                        f"Scene: 'Sergio grabs her breast while Maria is fucked by Tom' → "
-                        f"{{\"scene_tags\": \"threesome, breast grab, intercourse, explicit\", "
-                        f"\"present_chars\": [\"Sergio\", \"Maria\", \"Tom\"], "
-                        f"\"char_actions\": {{\"Sergio\": \"groping, kissing\", \"Maria\": \"being penetrated, being groped\", \"Tom\": \"thrusting, penetrating\"}}}}\n\n"
+                        f"\"char_actions\": {{\"Tom\": \"thrusting from behind, gripping Maria's hips, dominant\", "
+                        f"\"Maria\": \"bent over, being penetrated, moaning, hands on desk\"}}}}\n"
+                        f"Scene: 'Maria rides Tom while Sergio grabs her breasts and she sucks a third cock' → "
+                        f"{{\"scene_tags\": \"threesome, riding, oral, explicit, group sex\", "
+                        f"\"present_chars\": [\"Maria\", \"Tom\", \"Sergio\"], "
+                        f"\"char_actions\": {{\"Maria\": \"riding cowgirl, sucking cock, breasts being groped, arms forward\", "
+                        f"\"Tom\": \"lying on back being ridden, hands on Maria's thighs\", "
+                        f"\"Sergio\": \"standing, groping Maria's breasts from behind, watching\"}}}}\n\n"
                         f"Output raw JSON only. No markdown. No explanation."
                     ),
                 },
@@ -2087,8 +2154,8 @@ async def _scene_to_nai_structured(
 
         present_ordered = sorted(present, key=_mention_pos)
 
-        # Build char_captions with name prefix (Fix 3), action tags (Fix 1),
-        # in narrative order (Fix 2), skipping unknown cast members.
+        # Build char_captions with name prefix, action as natural language phrase (Suggestion 2),
+        # in narrative order, skipping unknown cast members.
         cast_by_name  = {c["name"]: c["tags"] for c in cast}
         char_captions = []
         other_tags_for_scene = []
@@ -2102,9 +2169,13 @@ async def _scene_to_nai_structured(
                 logger.info(f"1other '{name}' → scene_tags as '{name.lower()}'")
             else:
                 action  = char_actions.get(name, "")
-                caption = f"{name}, {tags}"          # Fix 3: name as anchor
+                # Suggestion 2: use natural language phrase for action, not just tag string
+                # This lets NAI V4.5 understand complex simultaneous actions
+                caption = f"{name}, {tags}"
                 if action:
-                    caption = caption.rstrip(", ") + f", {action}"  # Fix 1: pose tags
+                    # Append action as-is — can be a phrase like
+                    # "riding cowgirl, sucking cock, breasts being groped"
+                    caption = caption.rstrip(", ") + f", {action}"
                 char_captions.append({"char_caption": caption})
 
         # Append 1other entity names to scene tags
@@ -2267,8 +2338,14 @@ async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
             prev_present = p.get("present_chars", [])
             break
 
+    # Suggestion 3: Pre-process complex multi-action scenes before parsing.
+    # Detects coordination words and decomposes into explicit per-character statements.
+    parsed_scene_text = await _decompose_multi_action_scene(
+        scene_text, cast, debug_log=comic.get("debug_log")
+    )
+
     structured    = await _scene_to_nai_structured(
-        scene_text, cast,
+        parsed_scene_text, cast,
         debug_log=comic.get("debug_log"),
         original_phrase=comic.get("original_phrase", ""),
         prev_scene=prev_scene,
