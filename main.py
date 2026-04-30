@@ -715,6 +715,8 @@ async def finalize_game(context: ContextTypes.DEFAULT_TYPE, token: str):
             "input":        f"{_char_count_prefix(char_caps)}{quality_tags}, {raw_prefix}{structured['scene_tags']}",
             "char_captions": char_caps,
         }
+        # Cache origin scene_tags as persistent location anchor for all comic panels (Fix 1)
+        game["origin_scene_tags"] = structured["scene_tags"]
     else:
         game["nai_cast"] = []
         game["nai_tags"] = ""
@@ -896,18 +898,21 @@ async def set_comic_rounds_callback(update: Update, context: ContextTypes.DEFAUL
                                             random.randint(0, 2**32 - 1))
     comic_sessions[token]["debug_mode"] = game.get("debug_mode", False)
     comic_sessions[token]["debug_log"]  = game.get("debug_log")  # None or list
+    # Cache origin scene_tags as persistent location anchor for all panels (Fix 1)
+    comic_sessions[token]["origin_scene_tags"] = game.get("origin_scene_tags", "")
+    comic_sessions[token]["origin_location"]   = game.get("origin_location", "")
 
     # Carry the initial image forward so compile_comic can include it
     comic_sessions[token]["initial_image_data"] = game.get("initial_image_data")
 
-    # Per-character vibe reference map: char_tags → first image they appeared in
-    # Pre-populate main character with origin image
+    # Per-character vibe reference map: character NAME → first image they appeared in.
+    # Keyed by name (not tag string) so action tags changing each panel don't break lookup.
     initial_img  = game.get("initial_image_data")
     nai_cast     = game.get("nai_cast", [])
     char_first_panel = {}
     if initial_img and nai_cast:
-        main_tags = nai_cast[0]["tags"]
-        char_first_panel[main_tags] = initial_img
+        main_name = nai_cast[0]["name"]
+        char_first_panel[main_name] = initial_img
     comic_sessions[token]["char_first_panel"] = char_first_panel
 
     # Notify non-host players
@@ -1026,9 +1031,21 @@ async def _handle_comic_message_inner(
         prompt = await _build_panel_prompt_adult(comic, scene_text)
 
         # Build per-character vibe references from the char_first_panel map.
-        # Skip panels flagged as vibe_unreliable (generated via simplified fallback).
+        # Keyed by character NAME so action tags changing each panel don't break lookup.
+        # Skip panels flagged as vibe_unreliable.
         char_first_panel = comic.get("char_first_panel", {})
-        present_tags     = prompt.get("present_chars", [])
+        # present_chars from prompt contains full caption strings — extract names from cast
+        cast_by_caption  = {}
+        for c in comic.get("nai_cast", []):
+            cast_by_caption[c["name"]] = c["name"]  # name → name lookup for registry
+
+        # Get character names present in this scene from present_chars captions
+        present_names = []
+        for cap in prompt.get("present_chars", []):
+            # char_caption starts with "Name, ..." — extract first token
+            name = cap.split(",")[0].strip() if cap else ""
+            if name:
+                present_names.append(name)
 
         nai_refs = []
         seen     = set()
@@ -1039,9 +1056,9 @@ async def _handle_comic_message_inner(
             nai_refs.append(origin)
             seen.add(id(origin))
 
-        # Additional characters in scene — their first reliable appearance image
-        for tag_str in present_tags:
-            ref = char_first_panel.get(tag_str)
+        # Additional characters — look up by name
+        for name in present_names:
+            ref = char_first_panel.get(name)
             if ref and id(ref) not in seen and len(nai_refs) < 4:
                 nai_refs.append(ref)
                 seen.add(id(ref))
@@ -1166,14 +1183,16 @@ async def _handle_comic_message_inner(
         "present_chars":  present_char_names,
     })
 
-    # Update char_first_panel map — skip unreliable panels since they lack char_captions
-    # and would anchor inconsistent appearance for future panels.
+    # Update char_first_panel map — keyed by character NAME for stable lookup.
+    # Skip unreliable panels (simplified fallback, no char_captions).
     if is_adult and image_data and isinstance(prompt, dict) and not vibe_unreliable:
         char_first_panel = comic.setdefault("char_first_panel", {})
-        for tag_str in prompt.get("present_chars", []):
-            if tag_str and tag_str not in char_first_panel:
-                char_first_panel[tag_str] = image_data
-                logger.info(f"Registered first-appearance image for character: {tag_str[:60]}")
+        for cap in prompt.get("present_chars", []):
+            # Extract name from "Name, tags..." format
+            name = cap.split(",")[0].strip() if cap else ""
+            if name and name not in char_first_panel:
+                char_first_panel[name] = image_data
+                logger.info(f"Registered first-appearance image for: '{name}'")
 
     # Broadcast panel to all players
     author_name   = comic["player_names"].get(chat_id, "A player")
@@ -2257,6 +2276,26 @@ async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
     )
     scene_tags    = structured["scene_tags"]
     char_captions = structured["char_captions"]
+
+    # Fix 1: Anchor the established location into scene_tags on every panel.
+    # Extract location from original_phrase using Groq's scene_tags for the origin
+    # OR fall back to prepending the origin location directly.
+    # This prevents NAI drifting to a generic interior when the player doesn't
+    # re-specify the location in their panel prompt.
+    original_phrase = comic.get("original_phrase", "")
+    origin_location = comic.get("origin_location", "")  # cached after first panel
+    if not origin_location and original_phrase:
+        # Build a simple location anchor from the WHERE part of the original phrase
+        # by looking for location keywords from the phrase in scene_tags structure
+        # Use the origin's scene_tags (cached when comic started) if available
+        origin_location = comic.get("origin_scene_tags", "")
+    if origin_location:
+        # Only inject if scene_tags doesn't already contain the location signal
+        location_words = [w.strip() for w in origin_location.split(",")]
+        missing_locs = [w for w in location_words if w and w.lower() not in scene_tags.lower()]
+        if missing_locs:
+            scene_tags = ", ".join(missing_locs) + ", " + scene_tags
+            logger.info(f"Fix1: injected location anchor: {missing_locs}")
     cast_names_lower = {c["name"].lower() for c in cast}
     scene_char_count = len(char_captions)
 
