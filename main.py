@@ -2138,8 +2138,9 @@ async def _generate_char_tags_nai(
         )
         name_hint = f" The character's name is '{char_name}'." if char_name else ""
         adult_hint = (
-            " This is an adult game — unless the description specifies clothing, "
-            "default the state to 'naked' or 'nude'."
+            " This is an adult game. Include appropriate clothing or state based on the character's role "
+            "and description — e.g. a nurse wears a nurse uniform, a teacher wears formal clothes. "
+            "Only tag as 'nude' or 'naked' if the description explicitly mentions nudity."
             if adult_mode else ""
         )
         cast_hint = ""
@@ -2259,10 +2260,16 @@ async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
     cast_names_lower = {c["name"].lower() for c in cast}
     scene_char_count = len(char_captions)
 
-    # Detect new characters via two signals:
-    # 1. Scene parser returned more chars than exist in cast (existing logic)
-    # 2. Player's raw text contains a capitalised proper name not in the cast
-    #    e.g. "Sergio joins them" when cast has ['Maria','Tom'] → Sergio is genuinely new
+    # Common role words that introduce new characters even without a proper name
+    ROLE_WORDS = {"nurse", "doctor", "teacher", "professor", "stranger", "man", "woman",
+                  "girl", "boy", "lady", "guy", "boss", "maid", "bartender", "officer",
+                  "guard", "driver", "neighbor", "neighbour", "colleague", "secretary",
+                  "assistant", "manager", "student", "receptionist", "masseuse"}
+
+    # Detect new characters via three signals:
+    # 1. Scene parser returned more chars than exist in cast
+    # 2. Capitalised proper name not in cast (e.g. "Sergio joins them")
+    # 3. Lowercase role word not in cast (e.g. "a sexy nurse comes in")
     import re
     words_in_scene = set(re.findall(r"\b[A-Z][a-z]{2,}\b", scene_text))
     common_words   = {"Panel", "Scene", "Then", "They", "Them", "Their", "There",
@@ -2270,10 +2277,18 @@ async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
                       "While", "During", "Around", "Behind", "Between"}
     unknown_names  = {w for w in words_in_scene
                       if w.lower() not in cast_names_lower and w not in common_words}
-    if unknown_names:
-        logger.info(f"Potential new characters in scene text: {unknown_names}")
 
-    should_detect_new = (scene_char_count > len(cast)) or bool(unknown_names)
+    # Check for role words in scene text (lowercase)
+    scene_lower = scene_text.lower()
+    unknown_roles = {w for w in ROLE_WORDS
+                     if w in scene_lower and w not in cast_names_lower}
+
+    if unknown_names:
+        logger.info(f"Potential new named characters in scene text: {unknown_names}")
+    if unknown_roles:
+        logger.info(f"Potential new role characters in scene text: {unknown_roles}")
+
+    should_detect_new = (scene_char_count > len(cast)) or bool(unknown_names) or bool(unknown_roles)
 
     if should_detect_new:
         # Scene parser found more characters than exist in cast — genuinely new
@@ -2285,6 +2300,10 @@ async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
             cast_summary = "\n".join(
                 f"  label='{c['name']}', appearance={c['tags']}" for c in cast
             )
+            role_hint = (f"\nAlso detect any unnamed role characters (like 'nurse', 'doctor', 'stranger') "
+                        f"who appear in the scene but are not in the existing cast. "
+                        f"Use the role as their name label (e.g. name='Nurse', description='sexy nurse in uniform')."
+                        if unknown_roles else "")
             new_char_response = await client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 max_tokens=200,
@@ -2301,7 +2320,8 @@ async def _build_panel_prompt_adult(comic: dict, scene_text: str) -> dict:
                             f"SCENE: '{scene_text}'\n\n"
                             f"List only characters who appear in this scene but CANNOT be matched "
                             f"to any existing cast member by name, nickname, pronoun, or description. "
-                            f"If a name like 'Jack' could refer to an existing cast member, do NOT list it.\n"
+                            f"If a name like 'Jack' could refer to an existing cast member, do NOT list it."
+                            f"{role_hint}\n"
                             f"Return JSON array: [{{\"name\": \"label\", \"description\": \"brief description\"}}]\n"
                             f"Return [] if uncertain. Raw JSON only."
                         ),
